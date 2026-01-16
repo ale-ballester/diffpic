@@ -113,7 +113,7 @@ def plot_pde_solution(ts, y, boxsize, name="", label="", save_path=None):
     _maybe_save_or_show(fig, save_path=save_path)
 
 
-def plot_modes(ts, y, max_mode_spect, max_mode_time, boxsize, num=4, zero_mean=True, save_path=None):
+def plot_modes(ts, y, max_mode_spect, max_mode_time, boxsize, num=4, name="", label="", zero_mean=True, save_path=None):
     """
     y: real signal of shape (Nt, Nx). First axis time, second axis space.
     Plots magnitude/power spectra at a few time indices, and low-mode growth over time.
@@ -159,16 +159,17 @@ def plot_modes(ts, y, max_mode_spect, max_mode_time, boxsize, num=4, zero_mean=T
         t_pct = ts[index]
 
         axes[row, 0].stem(modes[show], mag[show])
-        axes[row, 0].set_ylabel(r"$|\rho_k(m)|$")
+        axes[row, 0].set_ylabel(label)
         axes[row, 0].set_title(f"Magnitude at t={t_pct:.1f}")
 
         axes[row, 1].semilogy(modes[show], power[show])
-        axes[row, 1].set_ylabel(r"$|\rho_k(m)|^2$")
+        axes[row, 1].set_ylabel(label)
         axes[row, 1].set_title(f"Power at t={t_pct:.1f}")
 
     axes[-1, 0].set_xlabel("Mode")
     axes[-1, 1].set_xlabel("Mode")
-
+    
+    plt.title(f"{name} spectrum")
     plt.tight_layout()
 
     # If we're saving, save this figure and the growth figure as a separate file.
@@ -188,9 +189,9 @@ def plot_modes(ts, y, max_mode_spect, max_mode_time, boxsize, num=4, zero_mean=T
     fig2 = plt.figure(figsize=(7, 4))
     plt.semilogy(ts, amps)
     plt.xlabel("Time")
-    plt.ylabel(r"$|\rho_k(m)|$")
-    plt.legend([f"m={i}" for i in range(1, max_mode_time + 1)])
-    plt.title("Growth of low modes (positive FFT modes)")
+    plt.ylabel(label)
+    plt.legend([f"k={i}" for i in range(1, max_mode_time + 1)])
+    plt.title(f"Growth of low modes: {name}")
     plt.tight_layout()
 
     _maybe_save_or_show(fig2, save_path=save_path_growth)

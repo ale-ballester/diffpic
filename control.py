@@ -149,15 +149,14 @@ class FourierActuator(eqx.Module):
             return jnp.zeros(self.N_mesh)
 
         if self.closed_loop:
-            # Same closed-loop stub you had; keep behavior
             if x is None:
                 raise ValueError("closed_loop=True requires state x to be provided.")
-            x_rom = x  # replace with your ROM mapping
+            x_rom = x  # replace with ROM mapping
             u = -(self.K0 @ x_rom)
             u = self.u_max * jnp.tanh(u / self.u_max)
             return u
 
-        # Open-loop: precompute full field and slice (same behavior as your prior class)
+        # Open-loop: precompute full field and slice
         E_all = self.field()
         return E_all[n.astype(int)]
     
@@ -195,7 +194,7 @@ class FourierActuator(eqx.Module):
         return summary
 
     # -----------------------
-    # Save / Load (updated)
+    # Save / Load
     # -----------------------
     def save_model(self, filename: str):
         with open(filename, "wb") as f:
