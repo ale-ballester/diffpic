@@ -2,43 +2,28 @@ import jax
 import jax.numpy as jnp
 from pic_simulation import PICSimulation
 from control import FourierActuator
+from losses import loss_metric, phase_invariant_loss
 from optimize import Optimizer
 from plotting import scatter_animation, plot_pde_solution, plot_modes
 import matplotlib.pyplot as plt
 
 # Simulation parameters
 N_particles = 40000  # Number of particles
-N_mesh = 400  # Number of mesh cells
-t1 = 30  # time at which simulation ends
+Nh = int(N_particles / 2)
+N_mesh = 256  # Number of mesh cells
+t1 = 20  # time at which simulation ends
 dt = 0.1  # timestep
 boxsize = 10*jnp.pi  # periodic domain [0,boxsize]
 n0 = 1  # electron number density
 vb = 2.4  # beam velocity
 vth = 0.5  # beam width
 pos_sample = False
+K = None
+seed_ic = 10
 n_modes_time = 1
 n_modes_space = 4
 
-
-key = jax.random.key(0)
-key1, key2, key3 = jax.random.split(key, num=3)
-
-if pos_sample:
-    pos = jax.random.uniform(key1, (N_particles, 1)) * boxsize
-else:
-    pos = jnp.zeros(N_particles)
-    for i in range(N_particles):
-        pos = pos.at[i].set(i*boxsize/N_particles)
-    pos = jax.random.choice(key1, pos, shape=pos.shape, replace=False)
-    pos = pos[:,None]
-
-vel = vth * jax.random.normal(key2, (N_particles, 1)) + vb
-Nh = int(N_particles / 2)
-vel = vel.at[Nh:].set(-1*vel[Nh:])
-
-y0 = (pos, vel)
-
-pic = PICSimulation(boxsize, N_particles, N_mesh, n0, dt, t1, t0=0, higher_moments=True)
+pic = PICSimulation(boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, t0=0, higher_moments=True)
 
 key = jax.random.PRNGKey(0)
 
@@ -54,11 +39,10 @@ E_control = FourierActuator(
     closed_loop=False,
 )
 
-def loss_metric(pic):
-    energy = jnp.mean((pic.E_field)**2)
-    return energy
+key = jax.random.key(seed_ic)
+y0 = pic.create_y0(key)
 
-optimizer = Optimizer(pic=pic,y0=y0,model=E_control,loss_metric=loss_metric,lr=1e-1)
+optimizer = Optimizer(pic=pic,model=E_control,K=K,y0=y0,loss_metric=loss_metric,lr=1e-1)
 
 E_control, train_losses, _ = optimizer.train(
     n_steps=200, 
@@ -66,22 +50,18 @@ E_control, train_losses, _ = optimizer.train(
     seed=0, 
     print_status=True)
 
-plt.figure()
-plt.plot(train_losses)
-plt.xlabel("Iteration")
-plt.ylabel("Training loss")
-plt.title("Training loss")
-plt.tight_layout()
+pic = PICSimulation(boxsize, N_particles, N_mesh, n0, vb, vth, dt, 2*t1, t0=0, higher_moments=True)
 
-plt.savefig("plots/trained/train_losses.png", dpi=300)
+E_control = FourierActuator.load_model("model/model_checkpoint_final")
 
 print("Control modes:\n", E_control.get_modes_summary())
 
-pic = PICSimulation(boxsize, N_particles, N_mesh, n0, dt, t1, t0=0, higher_moments=True)
+key = jax.random.key(seed_ic)
+y0 = pic.create_y0(key)
 
 pic = pic.run_simulation(y0,E_control=E_control)
 
-u = jax.vmap(E_control)(pic.ts)
+u = jax.vmap(E_control)(jnp.arange(pic.ts.shape[0]))
 
 plot_pde_solution(pic.ts, u, boxsize, name=r"External field", label=r"$E_{ext}$", save_path="plots/trained/external_field.png")
 
@@ -94,3 +74,12 @@ plot_pde_solution(pic.ts, pic.energy, boxsize, name=r"Energy", label=r"$E$", sav
 plot_modes(pic.ts, pic.rho, max_mode_spect=10, max_mode_time=5, boxsize=boxsize, name=r"Density", label=r"$\hat\rho_k$", num=4, zero_mean=True, save_path="plots/trained/density_modes.png")
 plot_modes(pic.ts, pic.momentum, max_mode_spect=10, max_mode_time=5, boxsize=boxsize, name=r"Momentum", label=r"$\hat\mathcal{{p}}_k$", num=4, zero_mean=True, save_path="plots/trained/momentum_modes.png")
 plot_modes(pic.ts, pic.energy, max_mode_spect=10, max_mode_time=5, boxsize=boxsize, name=r"Energy", label=r"$\hat\mathcal{{E}}_k$", num=4, zero_mean=True, save_path="plots/trained/energy_modes.png")
+
+plt.figure()
+plt.plot(train_losses)
+plt.xlabel("Iteration")
+plt.ylabel("Training loss")
+plt.title("Training loss")
+plt.tight_layout()
+
+plt.savefig("plots/trained/train_losses.png", dpi=300)

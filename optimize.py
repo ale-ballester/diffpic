@@ -12,23 +12,55 @@ jax.config.update("jax_enable_x64", True)
 from dataloader import DataLoader
 from utils import make_dir
 
+def grad_diagnostics(grads):
+    # Collect gradient leaves (JAX-safe)
+    leaves = jax.tree_util.tree_leaves(grads)
+
+    # Filter out None leaves
+    leaves = [g for g in leaves if g is not None]
+
+    # Number of gradient arrays
+    num_leaves = len(leaves)
+
+    # Flatten all gradients into one vector
+    flat_grads = jnp.concatenate([jnp.ravel(g) for g in leaves])
+
+    # Compute stats
+    max_abs = jnp.max(jnp.abs(flat_grads))
+    mean_abs = jnp.mean(jnp.abs(flat_grads))
+    l2_norm = jnp.linalg.norm(flat_grads)
+
+    # JAX-safe printing
+    jax.debug.print(
+        "Grad diagnostics | leaves: {n}, max|g|: {mx:.3e}, mean|g|: {mn:.3e}, ||g||₂: {l2:.3e}",
+        n=num_leaves,
+        mx=max_abs,
+        mn=mean_abs,
+        l2=l2_norm,
+    )
+
 class Optimizer():
     def __init__(self, pic,
-                       y0,
                        model,
                        loss_metric,
                        loss_kwargs=None,
+                       K=None,
+                       y0=None,
                        lr=1e-4,
                        optim=None,
                        save_dir="model/", 
                        save_name="model_checkpoint",
                        seed=0):
         self.pic = pic
+        self.K = K
         self.y0 = y0
+        if self.y0 is not None:
+            if self.y0[0].ndim != 2:
+                raise ValueError(f"Expected unbatched y0 (N,1). Got {self.y0[0].shape}")
         self.model = model
         if loss_kwargs is None: loss_kwargs = {}
         self.loss_metric = loss_metric
-        self.loss = lambda model: self.loss_function(model, **loss_kwargs) # Same signature as L2_loss, but different implementation
+        self.loss = lambda model, y0: self.loss_function(model, y0, **loss_kwargs) # Same signature as L2_loss, but different implementation
         self.grad_loss = eqx.filter_value_and_grad(self.loss) # Do NOT mutate loss after this point, it is jitted already
         self.lr = lr
         if optim is None:
@@ -38,14 +70,23 @@ class Optimizer():
 
         self.save_dir = save_dir
         self.save_name = save_name
-
-    def loss_function(self, model, **kwargs):
-        pic = self.pic.run_simulation(self.y0,E_control=model)
-        loss = self.loss_metric(pic, **kwargs)
-        return loss
     
-    def make_step(self, model, opt_state):
-        loss, grads = self.grad_loss(model)
+    def loss_function(self, model, y0, **kwargs):
+        pos, vel = y0
+        if pos.ndim == 2:   # (N,1) single IC
+            pic = self.pic.run_simulation((pos, vel), E_control=model)
+            return self.loss_metric(pic, **kwargs)
+
+        # batched: (K,N,1)
+        run_one = lambda pos_i, vel_i: self.pic.run_simulation((pos_i, vel_i), E_control=model)
+        pic_batch = jax.vmap(run_one)(pos, vel)
+        losses = jax.vmap(lambda pic: self.loss_metric(pic, **kwargs))(pic_batch)
+        return losses.mean()
+    
+    def make_step(self, model, opt_state, y0):
+        loss, grads = self.grad_loss(model, y0)
+        #grad_diagnostics(grads)
+        #jax.debug.print("{grads}",grads=grads)
         updates, opt_state = self.optim.update(grads, opt_state)
         model = eqx.apply_updates(model, updates)
         return loss, model, opt_state
@@ -60,18 +101,24 @@ class Optimizer():
         train_losses = []
         valid_losses = []
 
-        loader_key = jax.random.PRNGKey(seed)
+        ic_key = jax.random.PRNGKey(seed)
 
         for step in range(n_steps):            
             if print_status:
                 print("--------------------")
                 print(f"Step: {step}")
-            loader_key, train_loader_key = jax.random.split(loader_key)
+            ic_key, subkey = jax.random.split(ic_key)
+            ic_key_arr = None
+            if self.K is not None:
+                ic_key_arr = jax.random.split(subkey, self.K)
             start = time.time()
-            loss, self.model, opt_state = make_step(self.model, opt_state)
+            if self.K is not None:
+                y0 = jax.vmap(self.pic.create_y0)(ic_key_arr)
+            else:
+                y0 = self.y0
+            loss, self.model, opt_state = make_step(self.model, opt_state, y0)
             end = time.time()
             train_losses.append(loss)
-            loader_key, valid_loader_key = jax.random.split(loader_key)
             if print_status: print(f"Train loss: {loss}")
             if step % save_every == 0 and step > 0 and step < n_steps-1:
                 if print_status: print(f"Saving model at step {step}")

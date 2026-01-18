@@ -8,12 +8,15 @@ class PICSimulation(eqx.Module):
     N_mesh: int = eqx.field(static=True)
     dx: float = eqx.field(static=True)
     n0: float = eqx.field(static=True)
+    vb: float = eqx.field(static=True)
+    vth: float = eqx.field(static=True)
     dt: float = eqx.field(static=True)
     t0: float = eqx.field(static=True)
     t1: float = eqx.field(static=True)
     n_steps: float = eqx.field(static=True)
     m: float = eqx.field(static=True)
     q: float = eqx.field(static=True)
+    eps0: float = eqx.field(static=True)
 
     # Frequency
     k: jax.Array
@@ -33,18 +36,21 @@ class PICSimulation(eqx.Module):
     momentum: jax.Array
     energy: jax.Array
 
-    def __init__(self, boxsize, N_particles, N_mesh, n0, dt, t1, m=1, q=-1, t0=0, higher_moments=False):
+    def __init__(self, boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, m=1, q=1, eps0=1, t0=0, higher_moments=False):
         self.boxsize = boxsize
         self.N_particles = N_particles
         self.N_mesh = N_mesh
         self.dx = self.boxsize / self.N_mesh
-        self.n0 = n0
+        self.n0 = n0 # Background number density
+        self.vb = vb
+        self.vth = vth
         self.dt = dt
         self.t0 = t0
         self.t1 = t1
         self.n_steps = int(jnp.floor((self.t1-self.t0) / dt))
         self.m = m
         self.q = q
+        self.eps0 = eps0
 
         # Frequencies
         self.k = 2 * jnp.pi * jnp.fft.fftfreq(self.N_mesh, d=self.dx)  # Wavenumbers
@@ -63,6 +69,25 @@ class PICSimulation(eqx.Module):
         self.higher_moments = higher_moments
         self.momentum = None
         self.energy = None
+    
+    def create_y0(self, key, pos_sample: bool = False):
+        key_pos, key_vel = jax.random.split(key, 2)
+
+        N = self.N_particles
+        L = self.boxsize
+
+        if pos_sample:
+            pos = jax.random.uniform(key_pos, (N, 1)) * L
+        else:
+            idx = jax.random.permutation(key_pos, N)
+            pos = (idx.astype(jnp.float64) * (L / N))[:, None]
+
+        vel = self.vth * jax.random.normal(key_vel, (N, 1)) + self.vb
+        Nh = N // 2
+        vel = vel.at[Nh:, :].set(-vel[Nh:, :])
+        vel = vel - jnp.mean(vel)
+
+        return (pos, vel)
 
     def cic_deposition(self, pos, vel=None):
         pos = jnp.mod(pos, self.boxsize)
@@ -74,7 +99,7 @@ class PICSimulation(eqx.Module):
         frac = x - j.astype(x.dtype)
         weight_j = 1.0 - frac
         weight_jp1 = frac
-        w0 = self.n0 * (self.boxsize / self.N_particles) / self.dx
+        w0 = self.q * self.n0 * (self.boxsize / self.N_particles) / self.dx
 
         def deposit(q=None):
             if q is None:
@@ -84,19 +109,19 @@ class PICSimulation(eqx.Module):
                 g = jax.ops.segment_sum((weight_j * q)[:, 0], j[:, 0], num_segments=self.N_mesh)
                 g += jax.ops.segment_sum((weight_jp1 * q)[:, 0], jp1[:, 0], num_segments=self.N_mesh)
             return g * w0
-
+    
         moments = deposit()[:,None]
         if self.higher_moments:
-            momentum = deposit(vel)[:,None]
-            energy = deposit(0.5 * vel**2)[:,None]
+            momentum = deposit(self.m * vel)[:,None]
+            energy = deposit(0.5 * self.m * vel**2)[:,None]
             moments = jnp.concatenate((moments,momentum,energy),axis=-1)
         return moments, j, jp1, weight_j, weight_jp1
 
     def poisson_solver(self, rho):
         rho_k = jnp.fft.fft(rho)
-        rho_k = rho_k.at[0].set(0)
+        rho_k = rho_k.at[0].set(0) # Enforce quasineutrality
         phi_k = jnp.where(self.nonzero_k, -rho_k*self.k_masked_inv2, 0.0)
-        E_k = -1j * self.k * phi_k  # Electric field in k-space
+        E_k = -1j * self.k * phi_k / self.eps0  # Electric field in k-space
         E = jnp.fft.ifft(E_k).real  # Electric field in real space
         return E, rho_k
 
@@ -128,12 +153,15 @@ class PICSimulation(eqx.Module):
         if E_control is None:
             E_ext = None
         else:
-            E_ext = E_control(n) # Open loop (can add conditional with E_control.closed_loop)
+            if E_control.closed_loop:
+                E_ext = E_control(n, state=jnp.fft.rfft(moments[:,0]))
+            else:
+                E_ext = E_control(n)
 
         E = self.cic_gather((pos, vel, acc), E_grid, j, jp1, weight_j, weight_jp1, E_ext=E_ext)
 
         # update accelerations
-        acc = self.q*E/self.m
+        acc = -self.q*E/self.m
 
         # (1/2) kick
         vel += acc * self.dt / 2.0
@@ -152,11 +180,14 @@ class PICSimulation(eqx.Module):
         if E_control is None:
             E_ext = None
         else:
-            E_ext = E_control(jnp.asarray(0)) # Open loop (can add conditional with E_control.closed_loop)
+            if E_control.closed_loop:
+                E_ext = E_control(jnp.asarray(0), state=jnp.fft.rfft(moments[:,0]))
+            else:
+                E_ext = E_control(jnp.asarray(0))
 
         E = self.cic_gather((pos,vel,jnp.zeros_like(pos)), E_grid, j, jp1, weight_j, weight_jp1, E_ext=E_ext)
 
-        acc = -E
+        acc = -self.q*E/self.m
 
         y0 = (pos, vel, acc, E_grid, E_ext, moments)
 

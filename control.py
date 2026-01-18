@@ -1,6 +1,7 @@
 import json
 import jax
 import jax.numpy as jnp
+import jax.nn as jnn
 import equinox as eqx
 import scipy
 from typing import Optional, Tuple
@@ -91,15 +92,15 @@ class FourierActuator(eqx.Module):
             a = jnp.zeros(shape, dtype=jnp.complex64)
             b = jnp.zeros(shape, dtype=jnp.complex64)
         else:
-            k1, k2 = jax.random.split(key)
+            k1, k2, k3, k4 = jax.random.split(key, num=4)
             # small random complex init
             a = init_scale * (
                 jax.random.normal(k1, shape, dtype=jnp.float32)
-                + 1j * jax.random.normal(k1, shape, dtype=jnp.float32)
+                + 1j * jax.random.normal(k2, shape, dtype=jnp.float32)
             )
             b = init_scale * (
-                jax.random.normal(k2, shape, dtype=jnp.float32)
-                + 1j * jax.random.normal(k2, shape, dtype=jnp.float32)
+                jax.random.normal(k3, shape, dtype=jnp.float32)
+                + 1j * jax.random.normal(k4, shape, dtype=jnp.float32)
             )
             a = a.astype(jnp.complex64)
             b = b.astype(jnp.complex64)
@@ -168,7 +169,8 @@ class FourierActuator(eqx.Module):
         Only meaningful when n_modes_time == 1 (time-DC).
         """
         if self.n_modes_time != 1:
-            raise ValueError("get_modes_summary is only valid for n_modes_time == 1 (static field).")
+            #raise ValueError("get_modes_summary is only valid for n_modes_time == 1 (static field).")
+            return ""
 
         # Time-DC amplitudes (scalars)
         # a_hat_train[m, 0] and b_hat_train[m, 0] are real by construction
@@ -233,7 +235,181 @@ class FourierActuator(eqx.Module):
                 u_max=None,  # overwritten if present in leaves
             )
 
-            return eqx.tree_deserialise_leaves(f, model)    
+            return eqx.tree_deserialise_leaves(f, model)
+
+class ModeFeedbackActuator(eqx.Module):
+    # ---- required geometry ----
+    N_mesh: int
+    boxsize: float
+
+    # ---- feedback config ----
+    mlp: eqx.Module
+    K0: jax.Array              # control
+    dc_value: jax.Array
+    n_modes_space_in: int = 4     # Number of modes to control
+    n_modes_space_out: int = 4     # Number of modes to control
+    init_scale: float = 1.0    # For initialization
+
+    width: int = 64
+    depth: int = 2
+
+    # ---- constraints / regularization knobs ----
+    use_linear: bool = False
+    include_dc: bool = False        # usually False on periodic domain
+    u_max: float | None = None      # optional clip on |u_m| in Fourier domain
+
+    # ---- compatibility flags ----
+    zero: bool = False              # if True, always return 0 field
+    closed_loop: bool = True        # required so PIC knows to pass measurements, False not implemented
+
+    def __init__(self,N_mesh,boxsize,use_linear=False,width=64,depth=2,include_dc=False,u_max=None,zero=False,closed_loop=True,n_modes_space_in=4,n_modes_space_out=4,init_scale=1.0,*,key):
+        self.N_mesh = N_mesh
+        self.boxsize = boxsize
+        self.include_dc = include_dc
+        self.u_max = u_max
+        self.zero = zero
+        self.closed_loop = closed_loop
+        self.n_modes_space_in = n_modes_space_in
+        self.n_modes_space_out = n_modes_space_out
+        self.init_scale = init_scale
+        self.use_linear = use_linear
+
+        if self.use_linear:
+            k1, k2, k3 = jax.random.split(key, num=3)
+            shape = (self.n_modes_space_out,self.n_modes_space_in)
+            self.K0 = self.init_scale * (
+                    jax.random.normal(k1, shape, dtype=jnp.float64)
+                    + 1j * jax.random.normal(k2, shape, dtype=jnp.float64)
+                )
+            self.K0 = self.K0.astype(jnp.complex64)
+            if self.include_dc:
+                self.dc_value = self.init_scale * jax.random.normal(k3, (1,), dtype=jnp.float64)
+            else:
+                self.dc_value = None
+            self.mlp = None
+        else:
+            self.K0 = None
+            self.dc_value = None
+            in_size = 2*self.n_modes_space_in
+            out_size = 2*self.n_modes_space_out
+            if self.include_dc: 
+                in_size += 1
+                out_size += 1
+            self.mlp = eqx.nn.MLP(
+                in_size=in_size,
+                out_size=out_size,
+                width_size=width,
+                depth=depth,
+                activation=jnn.tanh,
+                key=key,
+            )
+
+    def __call__(self, n: int, *, state=None):
+        """Return E_ext(x) on the grid for step index n.
+
+        Parameters
+        ----------
+        n : int
+            time-step index (kept for interface compatibility; not used here).
+        state : complex array, shape (N_mesh//2+1,)
+            One-sided rFFT coefficients of state(x) at current step.
+\
+        Returns
+        -------
+        E_ext : float array, shape (N_mesh,)
+        """
+        #jax.debug.print("Current gain: {gain}", gain=jnp.linalg.norm(self.K0))
+        if self.zero:
+            return jnp.zeros((self.N_mesh,), dtype=jnp.float32)
+
+        if self.use_linear:
+            meas = state[1:self.n_modes_space_in+1]
+
+            # Feedback in Fourier domain: u_m = -K * meas
+            u_m = (-self.K0) @ meas
+
+            # Optional magnitude clipping (in complex plane)
+            if self.u_max is not None:
+                mag = jnp.abs(u_m)
+                u_m = jnp.where(mag > self.u_max, u_m * (self.u_max / (mag + 1e-12)), u_m)
+
+            # Build one-sided spectrum for E_ext and invert to real space
+            spec = jnp.zeros((self.N_mesh // 2 + 1,), dtype=jnp.complex64)
+
+            if self.include_dc:
+                spec = spec.at[0].set(jnp.array(self.dc_value[0], dtype=jnp.complex64))
+
+            spec = spec.at[1:self.n_modes_space_out+1].set(u_m.astype(jnp.complex64))
+        else:
+            state = state[:self.n_modes_space_in+1]
+            if not self.include_dc: state = state[1:]
+            u_m = self.mlp(jnp.concatenate((jnp.real(state),jnp.imag(state))))
+
+            spec = jnp.zeros((self.N_mesh // 2 + 1,), dtype=jnp.complex64)
+
+            if self.include_dc:
+                spec = spec.at[0].set(u_m[0])
+                modes = u_m[1:self.n_modes_space_out+1] + 1j * u_m[self.n_modes_space_out+1:]
+                spec = spec.at[1:self.n_modes_space_out].set(modes)
+            else:
+                modes = u_m[:self.n_modes_space_out] + 1j * u_m[self.n_modes_space_out:]
+                spec = spec.at[1:self.n_modes_space_out+1].set(modes)       
+
+        E_ext = jnp.fft.irfft(spec, n=self.N_mesh).real  # -> real-valued (N_mesh,)
+        #jax.debug.print("Output: {out}", out=jnp.linalg.norm(E_ext))
+        return E_ext
+
+    # -----------------------
+    # Save / Load
+    # -----------------------
+    def save_model(self, filename: str):
+        with open(filename, "wb") as f:
+            hyperparams = {
+                "zero": bool(self.zero),
+                "closed_loop": bool(self.closed_loop),
+                "N_mesh": int(self.N_mesh),
+                "boxsize": float(self.boxsize),
+                "width": int(self.width),
+                "depth": int(self.depth),
+                "n_modes_space_in": int(self.n_modes_space_in),
+                "n_modes_space_out": int(self.n_modes_space_out),
+                "init_scale": float(self.init_scale),
+
+                # actuator-specific hyperparams
+                "include_dc": bool(self.include_dc),
+                "use_linear": bool(self.use_linear),
+                "u_max": float(self.u_max) if self.u_max is not None else None
+            }
+            f.write((json.dumps(hyperparams) + "\n").encode())
+            eqx.tree_serialise_leaves(f, self)
+
+    @classmethod
+    def load_model(cls, filename: str):
+        with open(filename, "rb") as f:
+            hyperparams = json.loads(f.readline().decode())
+
+            model = cls(
+                # schema-compatible fields
+                N_mesh=hyperparams["N_mesh"],
+                boxsize=hyperparams["boxsize"],
+                n_modes_space_in=hyperparams.get("n_modes_space_in", 0),
+                n_modes_space_out=hyperparams.get("n_modes_space_out", 0),
+                width=hyperparams.get("width", 64),
+                depth=hyperparams.get("depth", 2),
+                init_scale=hyperparams.get("init_scale", 0.0),
+                zero=hyperparams.get("zero", False),
+                closed_loop=hyperparams.get("closed_loop", True),
+
+                # actuator-specific fields
+                include_dc=hyperparams.get("include_dc", False),
+                use_linear=hyperparams.get("use_linear", False),
+
+                # placeholders overwritten by leaves (if present)
+                u_max=hyperparams.get("u_max", None),
+                key=jax.random.key(0)
+            )
+
+            return eqx.tree_deserialise_leaves(f, model)
 
 def ctrb(A, B):
     n = A.shape[0]

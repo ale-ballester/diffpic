@@ -4,8 +4,9 @@ from pic_simulation import PICSimulation
 from plotting import scatter_animation, plot_pde_solution, plot_modes
 
 # Simulation parameters
-N_particles = 40000  # Number of particles
-N_mesh = 400  # Number of mesh cells
+N_particles = 100000  # Number of particles
+Nh = int(N_particles / 2)
+N_mesh = 4000  # Number of mesh cells
 t1 = 30  # time at which simulation ends
 dt = 0.1  # timestep
 boxsize = 10*jnp.pi  # periodic domain [0,boxsize]
@@ -15,26 +16,10 @@ vth = 0.5  # beam width
 pos_sample = False
 
 
-key = jax.random.key(0)
-key1, key2, key3 = jax.random.split(key, num=3)
+pic = PICSimulation(boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, t0=0, higher_moments=True)
 
-if pos_sample:
-    pos = jax.random.uniform(key1, (N_particles, 1)) * boxsize
-else:
-    pos = jnp.zeros(N_particles)
-    for i in range(N_particles):
-        pos = pos.at[i].set(i*boxsize/N_particles)
-    pos = jax.random.choice(key1, pos, shape=pos.shape, replace=False)
-    pos = pos[:,None]
-
-vel = vth * jax.random.normal(key2, (N_particles, 1)) + vb
-Nh = int(N_particles / 2)
-vel = vel.at[Nh:].set(-1*vel[Nh:])
-vel = vel - jnp.mean(vel)
-
-y0 = (pos, vel)
-
-pic = PICSimulation(boxsize, N_particles, N_mesh, n0, dt, t1, t0=0, higher_moments=True)
+key = jax.random.key(42)
+y0 = pic.create_y0(key)
 
 pic = pic.run_simulation(y0)
 
