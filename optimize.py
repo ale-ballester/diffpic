@@ -106,13 +106,11 @@ class Optimizer():
         for step in range(n_steps):            
             if print_status:
                 print("--------------------")
-                print(f"Step: {step}")
-            ic_key, subkey = jax.random.split(ic_key)
-            ic_key_arr = None
-            if self.K is not None:
-                ic_key_arr = jax.random.split(subkey, self.K)
+                print(f"Step: {step}")            
             start = time.time()
             if self.K is not None:
+                ic_key, subkey = jax.random.split(ic_key)
+                ic_key_arr = jax.random.split(subkey, self.K)
                 y0 = jax.vmap(self.pic.create_y0)(ic_key_arr)
             else:
                 y0 = self.y0

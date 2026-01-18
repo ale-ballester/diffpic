@@ -70,19 +70,142 @@ class PICSimulation(eqx.Module):
         self.momentum = None
         self.energy = None
     
-    def create_y0(self, key, pos_sample: bool = False):
-        key_pos, key_vel = jax.random.split(key, 2)
+    def create_y0(
+        self,
+        key,
+        pos_sample: bool = False,
+        *,
+        eps: float = 1e-2,
+        m_min: int = 1,
+        m_max: int = 4,
+        random_phase: bool = True,
+        random_amp: bool = True,
+        max_ar_iters: int = 50,
+    ):
+        """
+        Create initial conditions (pos, vel) with a tiny density perturbation:
+
+            p(x) ∝ 1 + Σ_{m=m_min}^{m_max} a_m cos(k_m x + φ_m),
+            k_m = 2π m / L,
+            a_m ~ Uniform(-eps, eps) if random_amp else a_m = eps,
+            φ_m ~ Uniform(0, 2π) if random_phase else φ_m = 0.
+
+        eps is the maximum amplitude magnitude for each mode.
+
+        - If pos_sample=True: sample positions via accept-reject from p(x) (approx; exact for given p).
+        - If pos_sample=False: "quiet start" positions with a small displacement map that imprints the same
+        density modulation to first order in eps (cheap + low noise).
+        """
+        key_pos, key_vel, key_pert = jax.random.split(key, 3)
 
         N = self.N_particles
         L = self.boxsize
 
-        if pos_sample:
-            pos = jax.random.uniform(key_pos, (N, 1)) * L
-        else:
-            idx = jax.random.permutation(key_pos, N)
-            pos = (idx.astype(jnp.float64) * (L / N))[:, None]
+        # Modes to include
+        m_min = int(m_min)
+        m_max = int(m_max)
+        if m_min < 1:
+            raise ValueError("m_min must be >= 1 (exclude DC).")
+        if m_max < m_min:
+            raise ValueError("m_max must be >= m_min.")
+        ms = jnp.arange(m_min, m_max + 1, dtype=jnp.float64)     # (M,)
+        ks = 2.0 * jnp.pi * ms / jnp.array(L, dtype=jnp.float64) # (M,)
+        M = ms.shape[0]
 
-        vel = self.vth * jax.random.normal(key_vel, (N, 1)) + self.vb
+        # Random amplitudes and phases
+        if random_amp:
+            key_pert, kamp = jax.random.split(key_pert)
+            amps = jax.random.uniform(kamp, (M,), minval=-eps, maxval=eps, dtype=jnp.float64)
+        else:
+            amps = jnp.full((M,), eps, dtype=jnp.float64)
+
+        if random_phase:
+            key_pert, kphi = jax.random.split(key_pert)
+            phis = jax.random.uniform(kphi, (M,), minval=0.0, maxval=2.0 * jnp.pi, dtype=jnp.float64)
+        else:
+            phis = jnp.zeros((M,), dtype=jnp.float64)
+
+        # Safety: ensure p(x) stays positive for accept-reject.
+        # A sufficient condition is Σ |a_m| < 1.
+        sum_abs = jnp.sum(jnp.abs(amps))
+        # If too large, scale down (keeps distribution valid)
+        scale = jnp.minimum(1.0, 0.99 / (sum_abs + 1e-12))
+        amps = amps * scale
+
+        # Helper: compute modulation S(x) = Σ a_m cos(k_m x + φ_m)
+        def S(x):
+            # x: (N,) float64
+            # returns: (N,) float64
+            x = x[:, None]  # (N,1)
+            return jnp.sum(amps[None, :] * jnp.cos(ks[None, :] * x + phis[None, :]), axis=1)
+
+        # -------------------------
+        # Positions with perturbation
+        # -------------------------
+        if pos_sample:
+            # Accept-reject from p(x) ∝ 1 + S(x)
+            # Accept prob = (1 + S(x)) / (1 + max(S)) where max(S) <= Σ|a_m|.
+            Smax = jnp.sum(jnp.abs(amps))  # safe upper bound on max |S|
+            denom = 1.0 + Smax
+
+            key_ar, key_u = jax.random.split(key_pos, 2)
+
+            def ar_round(carry, _):
+                key_ar, key_u, xs, filled = carry
+                key_ar, kx = jax.random.split(key_ar)
+                key_u, ku = jax.random.split(key_u)
+
+                x_prop = jax.random.uniform(kx, (N,), minval=0.0, maxval=L, dtype=jnp.float64)
+                u = jax.random.uniform(ku, (N,), minval=0.0, maxval=1.0, dtype=jnp.float64)
+
+                p = (1.0 + S(x_prop)) / denom
+                accept = u < p
+
+                x_acc = x_prop[accept]
+                n_acc = x_acc.shape[0]
+
+                space = N - filled
+                take = jnp.minimum(space, n_acc)
+
+                x_acc_pad = jnp.pad(x_acc, (0, N - n_acc))
+                xs = xs.at[filled:filled + take].set(x_acc_pad[:take])
+                filled = filled + take
+                return (key_ar, key_u, xs, filled), None
+
+            xs0 = jnp.zeros((N,), dtype=jnp.float64)
+            carry0 = (key_ar, key_u, xs0, jnp.array(0, dtype=jnp.int32))
+
+            (key_ar, key_u, xs, filled), _ = jax.lax.scan(
+                ar_round, carry0, xs=None, length=max_ar_iters
+            )
+
+            # Fallback fill if not fully accepted (rare for tiny eps)
+            key_ar, kfill = jax.random.split(key_ar)
+            x_fill = jax.random.uniform(kfill, (N,), minval=0.0, maxval=L, dtype=jnp.float64)
+            xs = jnp.where(jnp.arange(N) < filled, xs, x_fill)
+
+            pos = xs[:, None].astype(jnp.float64)
+
+        else:
+            # Quiet start baseline: permuted grid
+            idx = jax.random.permutation(key_pos, N)
+            x0 = (idx.astype(jnp.float64) * (jnp.array(L, dtype=jnp.float64) / jnp.array(N, dtype=jnp.float64)))  # (N,)
+
+            # Displacement map:
+            # Choose g(x) = Σ (a_m / k_m) sin(k_m x + φ_m)
+            # Then dx/dx0 = 1 + Σ a_m cos(k_m x0 + φ_m) = 1 + S(x0)
+            # Hence rho(x) ∝ 1/(dx/dx0) ≈ 1 - S(x0).
+            # To get +S in rho to first order, use x = x0 - g(x0).
+            x0_col = x0[:, None]  # (N,1)
+            g = jnp.sum((amps[None, :] / ks[None, :]) * jnp.sin(ks[None, :] * x0_col + phis[None, :]), axis=1)  # (N,)
+            x = jnp.mod(x0 - g, jnp.array(L, dtype=jnp.float64))
+
+            pos = x[:, None].astype(jnp.float64)
+
+        # -------------------------
+        # Velocities (unchanged)
+        # -------------------------
+        vel = self.vth * jax.random.normal(key_vel, (N, 1), dtype=jnp.float64) + jnp.array(self.vb, dtype=jnp.float64)
         Nh = N // 2
         vel = vel.at[Nh:, :].set(-vel[Nh:, :])
         vel = vel - jnp.mean(vel)

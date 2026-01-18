@@ -238,29 +238,32 @@ class FourierActuator(eqx.Module):
             return eqx.tree_deserialise_leaves(f, model)
 
 class ModeFeedbackActuator(eqx.Module):
-    # ---- required geometry ----
-    N_mesh: int
-    boxsize: float
+    # -------------------------
+    # Static hyperparameters
+    # -------------------------
+    N_mesh: int = eqx.field(static=True)
+    boxsize: float = eqx.field(static=True)
 
-    # ---- feedback config ----
-    mlp: eqx.Module
-    K0: jax.Array              # control
-    dc_value: jax.Array
-    n_modes_space_in: int = 4     # Number of modes to control
-    n_modes_space_out: int = 4     # Number of modes to control
-    init_scale: float = 1.0    # For initialization
+    n_modes_space_in: int = eqx.field(static=True)
+    n_modes_space_out: int = eqx.field(static=True)
+    init_scale: float = eqx.field(static=True)
 
-    width: int = 64
-    depth: int = 2
+    width: int = eqx.field(static=True)
+    depth: int = eqx.field(static=True)
 
-    # ---- constraints / regularization knobs ----
-    use_linear: bool = False
-    include_dc: bool = False        # usually False on periodic domain
-    u_max: float | None = None      # optional clip on |u_m| in Fourier domain
+    use_linear: bool = eqx.field(static=True)
+    include_dc: bool = eqx.field(static=True)
+    u_max: float | None = eqx.field(static=True)
 
-    # ---- compatibility flags ----
-    zero: bool = False              # if True, always return 0 field
-    closed_loop: bool = True        # required so PIC knows to pass measurements, False not implemented
+    zero: bool = eqx.field(static=True)
+    closed_loop: bool = eqx.field(static=True)
+
+    # -------------------------
+    # Learnable / leaf params
+    # -------------------------
+    mlp: eqx.Module | None
+    K0: jax.Array | None           # (n_out, n_in) complex64 if linear
+    dc_value: jax.Array | None     # (1,) float if include_dc else None
 
     def __init__(self,N_mesh,boxsize,use_linear=False,width=64,depth=2,include_dc=False,u_max=None,zero=False,closed_loop=True,n_modes_space_in=4,n_modes_space_out=4,init_scale=1.0,*,key):
         self.N_mesh = N_mesh
@@ -273,6 +276,8 @@ class ModeFeedbackActuator(eqx.Module):
         self.n_modes_space_out = n_modes_space_out
         self.init_scale = init_scale
         self.use_linear = use_linear
+        self.width = width
+        self.depth = depth
 
         if self.use_linear:
             k1, k2, k3 = jax.random.split(key, num=3)
@@ -341,19 +346,29 @@ class ModeFeedbackActuator(eqx.Module):
 
             spec = spec.at[1:self.n_modes_space_out+1].set(u_m.astype(jnp.complex64))
         else:
-            state = state[:self.n_modes_space_in+1]
-            if not self.include_dc: state = state[1:]
-            u_m = self.mlp(jnp.concatenate((jnp.real(state),jnp.imag(state))))
+            if self.mlp is None:
+                raise ValueError("use_linear=False but mlp is None.")
+
+            # Take the modes you want as input
+            s = state[: self.n_modes_space_in + 1]              # includes DC
+            if not self.include_dc:
+                s = s[1:]                                       # drop DC -> (n_in,)
+
+            x = jnp.concatenate([jnp.real(s), jnp.imag(s)], axis=0)  # (2*n_in,) real
+            if self.include_dc:
+                x = jnp.concatenate([jnp.array([jnp.real(state[0])], dtype=x.dtype), x], axis=0)
+
+            u_m = self.mlp(x)  # (2*n_out [+1]) real
 
             spec = jnp.zeros((self.N_mesh // 2 + 1,), dtype=jnp.complex64)
 
             if self.include_dc:
-                spec = spec.at[0].set(u_m[0])
+                spec = spec.at[0].set(jnp.array(u[0], dtype=jnp.complex64))
                 modes = u_m[1:self.n_modes_space_out+1] + 1j * u_m[self.n_modes_space_out+1:]
-                spec = spec.at[1:self.n_modes_space_out].set(modes)
+                spec = spec.at[1:self.n_modes_space_out+1].set(modes.astype(jnp.complex64))
             else:
                 modes = u_m[:self.n_modes_space_out] + 1j * u_m[self.n_modes_space_out:]
-                spec = spec.at[1:self.n_modes_space_out+1].set(modes)       
+                spec = spec.at[1:self.n_modes_space_out+1].set(modes.astype(jnp.complex64))       
 
         E_ext = jnp.fft.irfft(spec, n=self.N_mesh).real  # -> real-valued (N_mesh,)
         #jax.debug.print("Output: {out}", out=jnp.linalg.norm(E_ext))
@@ -374,11 +389,9 @@ class ModeFeedbackActuator(eqx.Module):
                 "n_modes_space_in": int(self.n_modes_space_in),
                 "n_modes_space_out": int(self.n_modes_space_out),
                 "init_scale": float(self.init_scale),
-
-                # actuator-specific hyperparams
                 "include_dc": bool(self.include_dc),
                 "use_linear": bool(self.use_linear),
-                "u_max": float(self.u_max) if self.u_max is not None else None
+                "u_max": float(self.u_max) if self.u_max is not None else None,
             }
             f.write((json.dumps(hyperparams) + "\n").encode())
             eqx.tree_serialise_leaves(f, self)
@@ -388,25 +401,22 @@ class ModeFeedbackActuator(eqx.Module):
         with open(filename, "rb") as f:
             hyperparams = json.loads(f.readline().decode())
 
+            # IMPORTANT: build the same structure as saved:
+            # use_linear/include_dc decide which leaves exist (K0/dc_value vs mlp).
             model = cls(
-                # schema-compatible fields
                 N_mesh=hyperparams["N_mesh"],
                 boxsize=hyperparams["boxsize"],
-                n_modes_space_in=hyperparams.get("n_modes_space_in", 0),
-                n_modes_space_out=hyperparams.get("n_modes_space_out", 0),
+                use_linear=hyperparams.get("use_linear", False),
                 width=hyperparams.get("width", 64),
                 depth=hyperparams.get("depth", 2),
-                init_scale=hyperparams.get("init_scale", 0.0),
+                include_dc=hyperparams.get("include_dc", False),
+                u_max=hyperparams.get("u_max", None),
                 zero=hyperparams.get("zero", False),
                 closed_loop=hyperparams.get("closed_loop", True),
-
-                # actuator-specific fields
-                include_dc=hyperparams.get("include_dc", False),
-                use_linear=hyperparams.get("use_linear", False),
-
-                # placeholders overwritten by leaves (if present)
-                u_max=hyperparams.get("u_max", None),
-                key=jax.random.key(0)
+                n_modes_space_in=hyperparams.get("n_modes_space_in", 4),
+                n_modes_space_out=hyperparams.get("n_modes_space_out", 4),
+                init_scale=hyperparams.get("init_scale", 1.0),
+                key=jax.random.PRNGKey(0),  # overwritten by deserialised leaves
             )
 
             return eqx.tree_deserialise_leaves(f, model)

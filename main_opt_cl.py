@@ -47,16 +47,16 @@ y0 = pic.create_y0(key)
 optimizer = Optimizer(pic=pic,model=E_control,K=K,y0=y0,loss_metric=loss_metric,lr=1e-2,save_dir="model_cl/")
 
 E_control, train_losses, _ = optimizer.train(
-    n_steps=200, 
+    n_steps=300, 
     save_every=100, 
     seed=0, 
     print_status=True)
 
 pic = PICSimulation(boxsize, N_particles, N_mesh, n0, vb, vth, dt, 2*t1, t0=0, higher_moments=True)
 
-#E_control = ModeFeedbackActuator.load_model("model_cl/model_checkpoint_final")
+E_control = ModeFeedbackActuator.load_model("model_cl/model_checkpoint_final")
 
-key = jax.random.key(seed_ic+1)
+key = jax.random.key(1024)
 y0 = pic.create_y0(key)
 
 pic = pic.run_simulation(y0,E_control=E_control)
