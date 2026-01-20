@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from pic_simulation import PICSimulation
 from control import FourierActuator
-from losses import loss_metric, phase_invariant_loss
+from losses import loss_metric, loss_metric_density_modes
 from optimize import Optimizer
 from plotting import scatter_animation, plot_pde_solution, plot_modes
 import matplotlib.pyplot as plt

@@ -363,7 +363,7 @@ class ModeFeedbackActuator(eqx.Module):
             spec = jnp.zeros((self.N_mesh // 2 + 1,), dtype=jnp.complex64)
 
             if self.include_dc:
-                spec = spec.at[0].set(jnp.array(u[0], dtype=jnp.complex64))
+                spec = spec.at[0].set(jnp.array(u_m[0], dtype=jnp.complex64))
                 modes = u_m[1:self.n_modes_space_out+1] + 1j * u_m[self.n_modes_space_out+1:]
                 spec = spec.at[1:self.n_modes_space_out+1].set(modes.astype(jnp.complex64))
             else:
@@ -416,6 +416,199 @@ class ModeFeedbackActuator(eqx.Module):
                 n_modes_space_in=hyperparams.get("n_modes_space_in", 4),
                 n_modes_space_out=hyperparams.get("n_modes_space_out", 4),
                 init_scale=hyperparams.get("init_scale", 1.0),
+                key=jax.random.PRNGKey(0),  # overwritten by deserialised leaves
+            )
+
+            return eqx.tree_deserialise_leaves(f, model)
+
+class DissipativeModeFeedbackActuator(eqx.Module):
+    # -------------------------
+    # Static hyperparameters
+    # -------------------------
+    N_mesh: int = eqx.field(static=True)
+    boxsize: float = eqx.field(static=True)
+
+    n_modes_space_in: int = eqx.field(static=True)
+    n_modes_space_out: int = eqx.field(static=True)
+
+    width: int = eqx.field(static=True)
+    depth: int = eqx.field(static=True)
+
+    include_dc: bool = eqx.field(static=True)
+    u_max: float | None = eqx.field(static=True)
+
+    zero: bool = eqx.field(static=True)
+    closed_loop: bool = eqx.field(static=True)
+
+    # -------------------------
+    # Learnable / leaf params
+    # -------------------------
+    mlp: eqx.Module | None
+
+    def __init__(
+        self,
+        N_mesh,
+        boxsize,
+        *,
+        width=64,
+        depth=2,
+        include_dc=False,
+        u_max=None,
+        zero=False,
+        closed_loop=True,
+        n_modes_space_in=4,
+        n_modes_space_out=4,
+        key,
+    ):
+        self.N_mesh = int(N_mesh)
+        self.boxsize = float(boxsize)
+        self.include_dc = bool(include_dc)
+        self.u_max = u_max
+        self.zero = bool(zero)
+        self.closed_loop = bool(closed_loop)
+        self.n_modes_space_in = int(n_modes_space_in)
+        self.n_modes_space_out = int(n_modes_space_out)
+        self.width = int(width)
+        self.depth = int(depth)
+
+        # INPUT: Re/Im of observed modes (plus optional DC real)
+        in_size = 2 * self.n_modes_space_in + (1 if self.include_dc else 0)
+
+        # OUTPUT: one REAL gain per complex output mode (plus optional DC gain)
+        out_size = self.n_modes_space_out + (1 if self.include_dc else 0)
+
+        self.mlp = eqx.nn.MLP(
+            in_size=in_size,
+            out_size=out_size,
+            width_size=self.width,
+            depth=self.depth,
+            activation=jnn.tanh,
+            key=key,
+        )
+
+    def __call__(self, n: int, *, state=None):
+        """Return E_ext(x) on the grid for step index n.
+
+        Parameters
+        ----------
+        n : int
+            timestep index (kept for interface compatibility)
+        state : complex array, shape (N_mesh//2+1,)
+            One-sided rFFT coefficients of momentum/current J(x) at current step.
+
+        Returns
+        -------
+        E_ext : float array, shape (N_mesh,)
+        """
+        if self.zero:
+            return jnp.zeros((self.N_mesh,), dtype=jnp.float64)
+        if self.mlp is None:
+            raise ValueError("MLP is required!")
+        if state is None:
+            raise ValueError("closed_loop actuator requires `state` (rFFT of momentum/current).")
+
+        # -------------------------
+        # Build REAL observation vector x_in from observed modes
+        # -------------------------
+        # Observe J modes: 1..n_in (and optional DC)
+        Jin = state[: self.n_modes_space_in + 1]  # includes DC at index 0
+
+        if self.include_dc:
+            # x_in = [J0_real, Re(J1..Jn), Im(J1..Jn)]
+            x_in = jnp.concatenate(
+                [
+                    jnp.array([jnp.real(Jin[0])], dtype=jnp.float64),
+                    jnp.real(Jin[1:]).astype(jnp.float64),
+                    jnp.imag(Jin[1:]).astype(jnp.float64),
+                ],
+                axis=0,
+            )  # shape: 1 + 2*n_in
+        else:
+            # x_in = [Re(J1..Jn), Im(J1..Jn)]
+            x_in = jnp.concatenate(
+                [
+                    jnp.real(Jin[1:]).astype(jnp.float64),
+                    jnp.imag(Jin[1:]).astype(jnp.float64),
+                ],
+                axis=0,
+            )  # shape: 2*n_in
+
+        # -------------------------
+        # Predict nonnegative gains (one per output mode [+ optional DC])
+        # -------------------------
+        gains = jnn.softplus(self.mlp(x_in)).astype(jnp.float64)  # (n_out [+1]), >= 0
+
+        # -------------------------
+        # Build dissipative control: E_m = -alpha_m * J_m  (controlled band)
+        # -------------------------
+        spec = jnp.zeros((self.N_mesh // 2 + 1,), dtype=jnp.complex64)
+
+        Jout = state[: self.n_modes_space_out + 1]  # includes DC at index 0
+
+        if self.include_dc:
+            alpha0 = gains[0]
+            J0 = jnp.real(Jout[0]).astype(jnp.float64)   # real
+            E0 = (-alpha0 * J0).astype(jnp.float64)      # real
+            spec = spec.at[0].set(E0.astype(jnp.complex64))
+
+            alpha = gains[1 : 1 + self.n_modes_space_out]  # (n_out,)
+            Jm = Jout[1 : 1 + self.n_modes_space_out]      # (n_out,) complex
+            # Because of the sign conventions in PICSimulator, dissipative means + sign here
+            Em = (alpha * Jm).astype(jnp.complex64)
+            spec = spec.at[1 : 1 + self.n_modes_space_out].set(Em)
+        else:
+            alpha = gains[: self.n_modes_space_out]        # (n_out,)
+            Jm = Jout[1 : 1 + self.n_modes_space_out]      # (n_out,) complex
+            # Because of the sign conventions in PICSimulator, dissipative means + sign here
+            Em = (alpha * Jm).astype(jnp.complex64)
+            spec = spec.at[1 : 1 + self.n_modes_space_out].set(Em)
+
+        # Optional magnitude clipping in Fourier domain
+        if self.u_max is not None:
+            mag = jnp.abs(spec)
+            spec = jnp.where(mag > self.u_max, spec * (self.u_max / (mag + 1e-12)), spec)
+
+        # Back to real space field
+        return jnp.fft.irfft(spec, n=self.N_mesh).real.astype(jnp.float64)
+
+    # -----------------------
+    # Save / Load
+    # -----------------------
+    def save_model(self, filename: str):
+        with open(filename, "wb") as f:
+            hyperparams = {
+                "zero": bool(self.zero),
+                "closed_loop": bool(self.closed_loop),
+                "N_mesh": int(self.N_mesh),
+                "boxsize": float(self.boxsize),
+                "width": int(self.width),
+                "depth": int(self.depth),
+                "n_modes_space_in": int(self.n_modes_space_in),
+                "n_modes_space_out": int(self.n_modes_space_out),
+                "include_dc": bool(self.include_dc),
+                "u_max": float(self.u_max) if self.u_max is not None else None,
+            }
+            f.write((json.dumps(hyperparams) + "\n").encode())
+            eqx.tree_serialise_leaves(f, self)
+
+    @classmethod
+    def load_model(cls, filename: str):
+        with open(filename, "rb") as f:
+            hyperparams = json.loads(f.readline().decode())
+
+            # IMPORTANT: build the same structure as saved:
+            # use_linear/include_dc decide which leaves exist (K0/dc_value vs mlp).
+            model = cls(
+                N_mesh=hyperparams["N_mesh"],
+                boxsize=hyperparams["boxsize"],
+                width=hyperparams.get("width", 64),
+                depth=hyperparams.get("depth", 2),
+                include_dc=hyperparams.get("include_dc", False),
+                u_max=hyperparams.get("u_max", None),
+                zero=hyperparams.get("zero", False),
+                closed_loop=hyperparams.get("closed_loop", True),
+                n_modes_space_in=hyperparams.get("n_modes_space_in", 4),
+                n_modes_space_out=hyperparams.get("n_modes_space_out", 4),
                 key=jax.random.PRNGKey(0),  # overwritten by deserialised leaves
             )
 

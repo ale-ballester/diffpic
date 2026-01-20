@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from pic_simulation import PICSimulation
 from plotting import scatter_animation, plot_pde_solution, plot_modes
+import matplotlib.pyplot as plt
 
 # Simulation parameters
 N_particles = 100000  # Number of particles
@@ -32,3 +33,11 @@ plot_pde_solution(pic.ts, pic.energy, boxsize, name=r"Energy", label=r"$E$", sav
 plot_modes(pic.ts, pic.rho, max_mode_spect=10, max_mode_time=5, boxsize=boxsize, name=r"Density", label=r"$\hat\rho_k$", num=4, zero_mean=True, save_path="plots/zir/density_modes.png")
 plot_modes(pic.ts, pic.momentum, max_mode_spect=10, max_mode_time=5, boxsize=boxsize, name=r"Momentum", label=r"$\hat\mathcal{{p}}_k$", num=4, zero_mean=True, save_path="plots/zir/momentum_modes.png")
 plot_modes(pic.ts, pic.energy, max_mode_spect=10, max_mode_time=5, boxsize=boxsize, name=r"Energy", label=r"$\hat\mathcal{{E}}_k$", num=4, zero_mean=True, save_path="plots/zir/energy_modes.png")
+
+plt.figure()
+plt.plot(pic.ts,jnp.sum(pic.energy+pic.E_field**2,axis=-1))
+plt.xlabel("Time")
+plt.ylabel("Energy")
+plt.title("Energy Evolution")
+plt.tight_layout()
+plt.savefig("plots/zir/energy_evolution.png", dpi=300)

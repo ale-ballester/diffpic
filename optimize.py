@@ -85,7 +85,7 @@ class Optimizer():
     
     def make_step(self, model, opt_state, y0):
         loss, grads = self.grad_loss(model, y0)
-        #grad_diagnostics(grads)
+        grad_diagnostics(grads)
         #jax.debug.print("{grads}",grads=grads)
         updates, opt_state = self.optim.update(grads, opt_state)
         model = eqx.apply_updates(model, updates)
