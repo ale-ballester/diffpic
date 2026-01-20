@@ -71,17 +71,17 @@ class PICSimulation(eqx.Module):
         self.energy = None
     
     def create_y0(
-        self,
-        key,
-        pos_sample: bool = False,
-        *,
-        eps: float = 1e-2,
-        m_min: int = 1,
-        m_max: int = 4,
-        random_phase: bool = True,
-        random_amp: bool = True,
-        max_ar_iters: int = 50,
-    ):
+            self,
+            key,
+            pos_sample: bool = False,
+            *,
+            eps: float = 1e-2,
+            m_min: int = 1,
+            m_max: int = 4,
+            random_phase: bool = True,
+            random_amp: bool = True,
+            max_ar_iters: int = 50,
+        ):
         """
         Create initial conditions (pos, vel) with a tiny density perturbation:
 
