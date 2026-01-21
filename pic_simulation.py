@@ -293,7 +293,6 @@ class PICSimulation(eqx.Module):
         _, outs = jax.lax.scan(step_fn, y0, xs=jnp.arange(len(self.ts)), length=self.n_steps)
 
         pos_traj, vel_traj, acc_traj, E_traj, Eext_traj, moments_traj = outs
-        print(moments_traj.shape)
 
         new_obj = None
         if self.higher_moments:
