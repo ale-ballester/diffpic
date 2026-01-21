@@ -13,8 +13,8 @@ class PICSimulation(eqx.Module):
     Ng: int = eqx.field(static=True)
     dx: jax.Array = eqx.field(static=True)
     n0: float = eqx.field(static=True)
-    vb: float = eqx.field(static=True)
-    vth: float = eqx.field(static=True)
+    vb: jax.Array = eqx.field(static=True)
+    vth: jax.Array = eqx.field(static=True)
     dt: float = eqx.field(static=True)
     t0: float = eqx.field(static=True)
     t1: float = eqx.field(static=True)
@@ -102,8 +102,13 @@ class PICSimulation(eqx.Module):
         # -------------------------
         # Velocities
         # -------------------------
-        v = self.vth * jax.random.normal(key_vel,shape=shape)
-        vel = v - v.mean(axis=0)
+        # thermal
+        vel = self.vth * jax.random.normal(key_vel, shape=(self.N_particles, self.dim)) + self.vb
+        Nh = self.N_particles // 2
+        vel = vel.at[Nh:, :].set(-vel[Nh:, :])
+
+        # enforce zero total momentum (helps remove finite-N bias)
+        vel = vel - jnp.mean(vel, axis=0, keepdims=True)
 
         return (pos, vel)
     
@@ -154,34 +159,37 @@ class PICSimulation(eqx.Module):
             
         moments = deposit() # rho
         if self.higher_moments:
-            momentum = deposit(self.m * vel)
-            energy = deposit(0.5 * self.m * vel**2)
+            momentum = deposit(self.m * vel) # TODO: These are mass moments, but my w0 includes charge
+            energy = deposit(0.5 * self.m * vel**2) # TODO: These are mass moments, but my w0 includes charge
             moments = jnp.concatenate((moments,momentum,energy),axis=-1)
         return moments
 
+    def cic_shape_factor(self):
+        # returns S(k) with shape N_mesh
+        S = 1.0
+        for a in range(self.dim):
+            ka = self.kvec[a]
+            # sinc(x) in numpy/jax is sin(pi x)/(pi x), so we must scale argument accordingly
+            # We want sinc(ka*dx/2) = sin(ka*dx/2)/(ka*dx/2)
+            # => use jnp.sinc((ka*dx/2)/pi) = jnp.sinc(ka*dx/(2*pi))
+            S = S * (jnp.sinc(ka * self.dx[a] / (2*jnp.pi))**2)
+        return S
+
     def poisson_solver(self, rho):
-        """
-        rho: real array with shape N_mesh = (N1, ..., Nd)
-        Returns:
-        E: real array with shape (*N_mesh, d)
-        rho_k: complex array with shape N_mesh
-        """
         rho_k = jnp.fft.fftn(rho)
-        # Enforce quasineutrality / remove DC mode
         rho_k = jnp.where(self.nonzero_k, rho_k, 0.0)
 
-        # Poisson in Fourier: -k^2 phi_k = rho_k / eps0  (depending on convention)
-        # Your old code effectively used phi_k = -rho_k * inv(k^2) (and applied eps0 later in E).
-        phi_k = jnp.where(self.nonzero_k, -rho_k / self.k2, 0.0)
+        S = self.cic_shape_factor()
+        S2 = jnp.where(self.nonzero_k, S**2, 1.0)
 
-        # E_k = -(grad phi)_k / eps0 = -(i k) phi_k / eps0
-        # Electric field is vector-valued now.
-        E_k = [(-1j * kcomp * phi_k / self.eps0) for kcomp in self.kvec]  # list of (N_mesh,) arrays
+        # Poisson: phi_k = - rho_k / (eps0 * k^2 * |S|^2)
+        phi_k = jnp.where(self.nonzero_k, -rho_k / (self.eps0 * self.k2 * S2), 0.0)
 
-        # Back to real space componentwise
-        E = jnp.stack([jnp.fft.ifftn(Ek).real for Ek in E_k], axis=-1)    # (*N_mesh, d)
+        # E_k = - i k phi_k   (no /eps0 here)
+        E_k = [(-1j * kcomp * phi_k) for kcomp in self.kvec]
 
-        return E, rho_k
+        E = jnp.stack([jnp.fft.ifftn(Ek).real for Ek in E_k], axis=-1)
+        return E, rho_k, phi_k
 
     def all_corner_bits(self, d: int, dtype=jnp.int32):
         C = 1 << d

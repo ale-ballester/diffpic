@@ -4,6 +4,8 @@ from pic_simulation import PICSimulation
 from plotting import plot_2d_spectrum_snapshots, plot_fields_snapshot, plot_lineouts, plot_low_mode_growth_2d, plot_time_series_diagnostics, animate_phase_slice_x_vx, animate_local_velocity_histogram, plot_energies_separate, plot_field_energy_growth, plot_max_mode_growth, plot_specific_mode_power, animate_marginal_phase_space
 import matplotlib.pyplot as plt
 
+jax.config.update('jax_enable_x64', True)
+
 # Simulation parameters
 N_particles = 100000  # Number of particles
 N_mesh = (400,400)  # Number of mesh cells

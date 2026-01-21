@@ -52,7 +52,6 @@ def _kinetic_energy(vel, m=1.0):
     # vel: (Np,2)
     return 0.5 * m * jnp.sum(jnp.sum(vel**2, axis=-1))
 
-
 def _momentum(vel, m=1.0):
     # vel: (Np,2)
     return m * jnp.sum(vel, axis=0)  # (2,)
