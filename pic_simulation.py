@@ -1,12 +1,17 @@
 import jax
+import math
 import jax.numpy as jnp
 import equinox as eqx
+import itertools
+from typing import Tuple
 
 class PICSimulation(eqx.Module):
-    boxsize: float = eqx.field(static=True)
+    dim: int = eqx.field(static=True)
+    boxsize: jax.Array = eqx.field(static=True)
     N_particles: int = eqx.field(static=True)
-    N_mesh: int = eqx.field(static=True)
-    dx: float = eqx.field(static=True)
+    N_mesh: Tuple[int, ...] = eqx.field(static=True)
+    Ng: int = eqx.field(static=True)
+    dx: jax.Array = eqx.field(static=True)
     n0: float = eqx.field(static=True)
     vb: float = eqx.field(static=True)
     vth: float = eqx.field(static=True)
@@ -19,10 +24,9 @@ class PICSimulation(eqx.Module):
     eps0: float = eqx.field(static=True)
 
     # Frequency
-    k: jax.Array
+    kvec: jax.Array
+    k2: jax.Array
     nonzero_k: jax.Array
-    k_masked: jax.Array
-    k_masked_inv2: jax.Array
 
     # Trajectories
     ts: jax.Array
@@ -36,11 +40,13 @@ class PICSimulation(eqx.Module):
     momentum: jax.Array
     energy: jax.Array
 
-    def __init__(self, boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, m=1, q=1, eps0=1, t0=0, higher_moments=False):
+    def __init__(self, dim, boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, m=1, q=1, Z=1, eps0=1, t0=0, higher_moments=False):
+        self.dim = dim
         self.boxsize = boxsize
         self.N_particles = N_particles
         self.N_mesh = N_mesh
-        self.dx = self.boxsize / self.N_mesh
+        self.Ng = math.prod(self.N_mesh)
+        self.dx = self.boxsize / jnp.array(self.N_mesh)
         self.n0 = n0 # Background number density
         self.vb = vb
         self.vth = vth
@@ -53,10 +59,22 @@ class PICSimulation(eqx.Module):
         self.eps0 = eps0
 
         # Frequencies
-        self.k = 2 * jnp.pi * jnp.fft.fftfreq(self.N_mesh, d=self.dx)  # Wavenumbers
-        self.nonzero_k = self.k != 0
-        self.k_masked = jnp.where(self.nonzero_k, self.k, 1.0)
-        self.k_masked_inv2 = 1.0/self.k_masked**2
+        d = len(self.N_mesh)
+        k1d = [
+            (2 * jnp.pi) * jnp.fft.fftfreq(self.N_mesh[a], d=float(self.boxsize[a] / self.N_mesh[a]))
+            for a in range(d)
+        ]  # list of (Na,) arrays
+
+        # Mesh the components onto full N_mesh grid
+        kvec = jnp.meshgrid(*k1d, indexing="ij")  # tuple length d, each shape N_mesh
+        self.kvec = kvec
+
+        self.k2 = jnp.zeros(self.N_mesh)
+        for kc in self.kvec:
+            self.k2 = self.k2 + kc ** 2
+
+        # Mask out k=0 (the DC mode). For a full fftn grid, DC is at index (0,0,...,0).
+        self.nonzero_k = jnp.ones(self.N_mesh, dtype=bool).at[(0,) * d].set(False)
 
         # Trajectories
         self.ts = self.t0 + dt * jnp.arange(self.n_steps)
@@ -73,189 +91,143 @@ class PICSimulation(eqx.Module):
     def create_y0(
         self,
         key,
-        pos_sample: bool = False,
-        *,
-        eps: float = 1e-2,
-        m_min: int = 1,
-        m_max: int = 4,
-        random_phase: bool = True,
-        random_amp: bool = True,
-        max_ar_iters: int = 50,
     ):
-        """
-        Create initial conditions (pos, vel) with a tiny density perturbation:
+        key_pos, key_vel = jax.random.split(key, 2)
 
-            p(x) ∝ 1 + Σ_{m=m_min}^{m_max} a_m cos(k_m x + φ_m),
-            k_m = 2π m / L,
-            a_m ~ Uniform(-eps, eps) if random_amp else a_m = eps,
-            φ_m ~ Uniform(0, 2π) if random_phase else φ_m = 0.
+        shape = (self.N_particles,self.dim)
 
-        eps is the maximum amplitude magnitude for each mode.
-
-        - If pos_sample=True: sample positions via accept-reject from p(x) (approx; exact for given p).
-        - If pos_sample=False: "quiet start" positions with a small displacement map that imprints the same
-        density modulation to first order in eps (cheap + low noise).
-        """
-        key_pos, key_vel, key_pert = jax.random.split(key, 3)
-
-        N = self.N_particles
-        L = self.boxsize
-
-        # Modes to include
-        m_min = int(m_min)
-        m_max = int(m_max)
-        if m_min < 1:
-            raise ValueError("m_min must be >= 1 (exclude DC).")
-        if m_max < m_min:
-            raise ValueError("m_max must be >= m_min.")
-        ms = jnp.arange(m_min, m_max + 1, dtype=jnp.float64)     # (M,)
-        ks = 2.0 * jnp.pi * ms / jnp.array(L, dtype=jnp.float64) # (M,)
-        M = ms.shape[0]
-
-        # Random amplitudes and phases
-        if random_amp:
-            key_pert, kamp = jax.random.split(key_pert)
-            amps = jax.random.uniform(kamp, (M,), minval=-eps, maxval=eps, dtype=jnp.float64)
-        else:
-            amps = jnp.full((M,), eps, dtype=jnp.float64)
-
-        if random_phase:
-            key_pert, kphi = jax.random.split(key_pert)
-            phis = jax.random.uniform(kphi, (M,), minval=0.0, maxval=2.0 * jnp.pi, dtype=jnp.float64)
-        else:
-            phis = jnp.zeros((M,), dtype=jnp.float64)
-
-        # Safety: ensure p(x) stays positive for accept-reject.
-        # A sufficient condition is Σ |a_m| < 1.
-        sum_abs = jnp.sum(jnp.abs(amps))
-        # If too large, scale down (keeps distribution valid)
-        scale = jnp.minimum(1.0, 0.99 / (sum_abs + 1e-12))
-        amps = amps * scale
-
-        # Helper: compute modulation S(x) = Σ a_m cos(k_m x + φ_m)
-        def S(x):
-            # x: (N,) float64
-            # returns: (N,) float64
-            x = x[:, None]  # (N,1)
-            return jnp.sum(amps[None, :] * jnp.cos(ks[None, :] * x + phis[None, :]), axis=1)
+        x = jax.random.uniform(key_pos,shape=shape,minval=jnp.zeros(self.dim),maxval=self.boxsize)
+        pos = jnp.mod(x,self.boxsize)
 
         # -------------------------
-        # Positions with perturbation
+        # Velocities
         # -------------------------
-        if pos_sample:
-            # Accept-reject from p(x) ∝ 1 + S(x)
-            # Accept prob = (1 + S(x)) / (1 + max(S)) where max(S) <= Σ|a_m|.
-            Smax = jnp.sum(jnp.abs(amps))  # safe upper bound on max |S|
-            denom = 1.0 + Smax
-
-            key_ar, key_u = jax.random.split(key_pos, 2)
-
-            def ar_round(carry, _):
-                key_ar, key_u, xs, filled = carry
-                key_ar, kx = jax.random.split(key_ar)
-                key_u, ku = jax.random.split(key_u)
-
-                x_prop = jax.random.uniform(kx, (N,), minval=0.0, maxval=L, dtype=jnp.float64)
-                u = jax.random.uniform(ku, (N,), minval=0.0, maxval=1.0, dtype=jnp.float64)
-
-                p = (1.0 + S(x_prop)) / denom
-                accept = u < p
-
-                x_acc = x_prop[accept]
-                n_acc = x_acc.shape[0]
-
-                space = N - filled
-                take = jnp.minimum(space, n_acc)
-
-                x_acc_pad = jnp.pad(x_acc, (0, N - n_acc))
-                xs = xs.at[filled:filled + take].set(x_acc_pad[:take])
-                filled = filled + take
-                return (key_ar, key_u, xs, filled), None
-
-            xs0 = jnp.zeros((N,), dtype=jnp.float64)
-            carry0 = (key_ar, key_u, xs0, jnp.array(0, dtype=jnp.int32))
-
-            (key_ar, key_u, xs, filled), _ = jax.lax.scan(
-                ar_round, carry0, xs=None, length=max_ar_iters
-            )
-
-            # Fallback fill if not fully accepted (rare for tiny eps)
-            key_ar, kfill = jax.random.split(key_ar)
-            x_fill = jax.random.uniform(kfill, (N,), minval=0.0, maxval=L, dtype=jnp.float64)
-            xs = jnp.where(jnp.arange(N) < filled, xs, x_fill)
-
-            pos = xs[:, None].astype(jnp.float64)
-
-        else:
-            # Quiet start baseline: permuted grid
-            idx = jax.random.permutation(key_pos, N)
-            x0 = (idx.astype(jnp.float64) * (jnp.array(L, dtype=jnp.float64) / jnp.array(N, dtype=jnp.float64)))  # (N,)
-
-            # Displacement map:
-            # Choose g(x) = Σ (a_m / k_m) sin(k_m x + φ_m)
-            # Then dx/dx0 = 1 + Σ a_m cos(k_m x0 + φ_m) = 1 + S(x0)
-            # Hence rho(x) ∝ 1/(dx/dx0) ≈ 1 - S(x0).
-            # To get +S in rho to first order, use x = x0 - g(x0).
-            x0_col = x0[:, None]  # (N,1)
-            g = jnp.sum((amps[None, :] / ks[None, :]) * jnp.sin(ks[None, :] * x0_col + phis[None, :]), axis=1)  # (N,)
-            x = jnp.mod(x0 - g, jnp.array(L, dtype=jnp.float64))
-
-            pos = x[:, None].astype(jnp.float64)
-
-        # -------------------------
-        # Velocities (unchanged)
-        # -------------------------
-        vel = self.vth * jax.random.normal(key_vel, (N, 1), dtype=jnp.float64) + jnp.array(self.vb, dtype=jnp.float64)
-        Nh = N // 2
-        vel = vel.at[Nh:, :].set(-vel[Nh:, :])
-        vel = vel - jnp.mean(vel)
+        v = self.vth * jax.random.normal(key_vel,shape=shape)
+        vel = v - v.mean(axis=0)
 
         return (pos, vel)
+    
+    def _ravel_multi_index(self, idxs, dims):
+        """idxs: (..., d) in [0, dims); dims: (d,) ints -> linear index (...,)"""
+        dims = jnp.asarray(dims, dtype=jnp.int32)
+        strides = jnp.concatenate([jnp.cumprod(dims[::-1])[::-1][1:], jnp.array([1], jnp.int32)])
+        # strides = [prod(dims[1:]), prod(dims[2:]), ..., 1]
+        return jnp.sum(idxs * strides, axis=-1)
 
     def cic_deposition(self, pos, vel=None):
         pos = jnp.mod(pos, self.boxsize)
 
-        x = pos / self.dx
-        j = jnp.floor(x).astype(jnp.int32)
-        j = jnp.mod(j, self.N_mesh)
-        jp1 = jnp.mod(j + 1, self.N_mesh)
-        frac = x - j.astype(x.dtype)
-        weight_j = 1.0 - frac
-        weight_jp1 = frac
-        w0 = self.q * self.n0 * (self.boxsize / self.N_particles) / self.dx
+        N_mesh = jnp.asarray(self.N_mesh, dtype=jnp.int32)
+        x = pos / self.dx                                # (Np, d)  dx is (d,)
+        j0 = jnp.floor(x).astype(jnp.int32)              # (Np, d)
+        frac = x - j0.astype(x.dtype)                    # (Np, d)
+        j0 = jnp.mod(j0, N_mesh)                    # periodic wrap
+        d = frac.shape[-1]
+
+        cell_vol = jnp.prod(self.dx)
+        w0 = (self.q * self.n0) * (jnp.prod(self.boxsize) / self.N_particles) / cell_vol
+
+        #grid_idx = [slice(0,1) for i in range(d)]
+        #meshgrid = jnp.mgrid[grid_idx]
 
         def deposit(q=None):
             if q is None:
-                g = jax.ops.segment_sum(weight_j[:, 0], j[:, 0], num_segments=self.N_mesh)
-                g += jax.ops.segment_sum(weight_jp1[:, 0], jp1[:, 0], num_segments=self.N_mesh)
+                shape = (*self.N_mesh, 1)
+                moment_flat = jnp.zeros((self.Ng,1))
             else:
-                g = jax.ops.segment_sum((weight_j * q)[:, 0], j[:, 0], num_segments=self.N_mesh)
-                g += jax.ops.segment_sum((weight_jp1 * q)[:, 0], jp1[:, 0], num_segments=self.N_mesh)
-            return g * w0
-    
-        moments = deposit()[:,None]
+                shape = (*self.N_mesh, self.dim)
+                moment_flat = jnp.zeros((self.Ng,self.dim))
+            for bits in itertools.product([0, 1], repeat=int(d)):
+                b = jnp.array(bits, dtype=jnp.int32)                     # (d,)
+                # node indices for this corner
+                jj = jnp.mod(j0 + b, N_mesh)                             # (Np, d)
+                lin = self._ravel_multi_index(jj, N_mesh)                # (Np,)
+
+                # product weight for this corner
+                w = jnp.where(b[None, :] == 1, frac, 1.0 - frac)         # (Np, d)
+                w = jnp.prod(w, axis=-1)            # (Np,)
+                
+                if q is None: q=1
+                contrib = w0[...,None] * w[...,None] * q
+                moment_flat = moment_flat.at[lin].add(contrib)
+            return moment_flat.reshape(shape)
+            
+        moments = deposit() # rho
         if self.higher_moments:
-            momentum = deposit(self.m * vel)[:,None]
-            energy = deposit(0.5 * self.m * vel**2)[:,None]
+            momentum = deposit(self.m * vel)
+            energy = deposit(0.5 * self.m * vel**2)
             moments = jnp.concatenate((moments,momentum,energy),axis=-1)
-        return moments, j, jp1, weight_j, weight_jp1
+        return moments
 
     def poisson_solver(self, rho):
-        rho_k = jnp.fft.fft(rho)
-        rho_k = rho_k.at[0].set(0) # Enforce quasineutrality
-        phi_k = jnp.where(self.nonzero_k, -rho_k*self.k_masked_inv2, 0.0)
-        E_k = -1j * self.k * phi_k / self.eps0  # Electric field in k-space
-        E = jnp.fft.ifft(E_k).real  # Electric field in real space
+        """
+        rho: real array with shape N_mesh = (N1, ..., Nd)
+        Returns:
+        E: real array with shape (*N_mesh, d)
+        rho_k: complex array with shape N_mesh
+        """
+        rho_k = jnp.fft.fftn(rho)
+        # Enforce quasineutrality / remove DC mode
+        rho_k = jnp.where(self.nonzero_k, rho_k, 0.0)
+
+        # Poisson in Fourier: -k^2 phi_k = rho_k / eps0  (depending on convention)
+        # Your old code effectively used phi_k = -rho_k * inv(k^2) (and applied eps0 later in E).
+        phi_k = jnp.where(self.nonzero_k, -rho_k / self.k2, 0.0)
+
+        # E_k = -(grad phi)_k / eps0 = -(i k) phi_k / eps0
+        # Electric field is vector-valued now.
+        E_k = [(-1j * kcomp * phi_k / self.eps0) for kcomp in self.kvec]  # list of (N_mesh,) arrays
+
+        # Back to real space componentwise
+        E = jnp.stack([jnp.fft.ifftn(Ek).real for Ek in E_k], axis=-1)    # (*N_mesh, d)
+
         return E, rho_k
 
-    def cic_gather(self, y, E_grid, j, jp1, weight_j, weight_jp1, E_ext=None):
-        pos, vel, acc = y
-        # Interpolate grid value onto particle locations
-        E = weight_j * E_grid[j] + weight_jp1 * E_grid[jp1]
+    def all_corner_bits(self, d: int, dtype=jnp.int32):
+        C = 1 << d
+        c = jnp.arange(C, dtype=jnp.uint32)[:, None]          # (C, 1)
+        shifts = jnp.arange(d, dtype=jnp.uint32)[None, :]     # (1, d)
+        B = (c >> shifts) & jnp.uint32(1)                     # (C, d)
+        return B.astype(dtype)
 
-        # Add external electric field
+    def cic_gather(self, y, E_grid, E_ext=None):
+        """
+        y: (pos, vel, acc) where pos is (Np, d)
+        E_grid: (*N_mesh, d) real
+        E_ext:  (*N_mesh, d) real or None
+        Returns:
+        E: (Np, d) gathered field at particles
+        """
+        pos, vel, acc = y
+        pos = jnp.mod(pos, self.boxsize)                      # (Np, d)
+
+        x = pos / self.dx                                     # (Np, d)
+        j0 = jnp.floor(x).astype(jnp.int32)                   # (Np, d)
+        frac = x - j0.astype(x.dtype)                         # (Np, d)
+        N_mesh = jnp.asarray(self.N_mesh, dtype=jnp.int32)
+        j0 = jnp.mod(j0, N_mesh)                              # periodic wrap
+
+        Np, d = frac.shape
+        B = self.all_corner_bits(d, dtype=jnp.int32)               # (C, d)
+        C = B.shape[0]
+
+        # Corner indices for each particle: (C, Np, d)
+        jj = jnp.mod(j0[None, :, :] + B[:, None, :], N_mesh[None, None, :])
+
+        # Corner weights: (C, Np)
+        w = jnp.where(B[:, None, :] == 1, frac[None, :, :], 1.0 - frac[None, :, :])
+        w = jnp.prod(w, axis=-1)          # (C, Np)
+
+        # Gather E_grid at all corners.
+        # Use advanced indexing by splitting indices per dimension.
+        idx = tuple(jj[..., a] for a in range(d))             # tuple of (C, Np) int arrays
+        Eg = E_grid[idx]                                      # (C, Np, d)
+
         if E_ext is not None:
-            E += weight_j * E_ext[j] + weight_jp1 * E_ext[jp1]
+            Eg = Eg + E_ext[idx]                              # (C, Np, d)
+
+        # Weighted sum over corners -> (Np, d)
+        E = jnp.sum(w[..., None] * Eg, axis=0)                # sum over C
 
         return E
 
@@ -269,19 +241,19 @@ class PICSimulation(eqx.Module):
         pos += vel * self.dt
         pos = jnp.mod(pos, self.boxsize)
 
-        moments, j, jp1, weight_j, weight_jp1 = self.cic_deposition(pos, vel)
-        E_grid, rho_k = self.poisson_solver(moments[:,0])
+        moments = self.cic_deposition(pos, vel)
+        E_grid, rho_k = self.poisson_solver(moments[...,0])
 
         E_ext = 0
         if E_control is None:
             E_ext = None
         else:
             if E_control.closed_loop:
-                E_ext = E_control(n, state=jnp.fft.rfft(moments[:,1]))
+                E_ext = E_control(n, state=jnp.fft.rfft(moments[...,0]))
             else:
                 E_ext = E_control(n)
 
-        E = self.cic_gather((pos, vel, acc), E_grid, j, jp1, weight_j, weight_jp1, E_ext=E_ext)
+        E = self.cic_gather((pos, vel, acc), E_grid, E_ext=E_ext)
 
         # update accelerations
         acc = -self.q*E/self.m
@@ -296,19 +268,19 @@ class PICSimulation(eqx.Module):
 
         pos = jnp.mod(pos, self.boxsize)
 
-        moments, j, jp1, weight_j, weight_jp1 = self.cic_deposition(pos, vel)
-        E_grid, rho_k = self.poisson_solver(moments[:,0])
+        moments = self.cic_deposition(pos, vel)
+        E_grid, rho_k = self.poisson_solver(moments[...,0])
 
         E_ext = 0
         if E_control is None:
             E_ext = None
         else:
             if E_control.closed_loop:
-                E_ext = E_control(jnp.asarray(0), state=jnp.fft.rfft(moments[:,1]))
+                E_ext = E_control(jnp.asarray(0), state=jnp.fft.rfft(moments[...,0]))
             else:
                 E_ext = E_control(jnp.asarray(0))
 
-        E = self.cic_gather((pos,vel,jnp.zeros_like(pos)), E_grid, j, jp1, weight_j, weight_jp1, E_ext=E_ext)
+        E = self.cic_gather((pos,vel,jnp.zeros_like(pos)), E_grid, E_ext=E_ext)
 
         acc = -self.q*E/self.m
 
@@ -321,20 +293,21 @@ class PICSimulation(eqx.Module):
         _, outs = jax.lax.scan(step_fn, y0, xs=jnp.arange(len(self.ts)), length=self.n_steps)
 
         pos_traj, vel_traj, acc_traj, E_traj, Eext_traj, moments_traj = outs
+        print(moments_traj.shape)
 
         new_obj = None
         if self.higher_moments:
             new_obj = eqx.tree_at(
                 lambda s: (s.positions, s.velocities, s.accelerations, s.E_field, s.E_ext, s.rho, s.momentum, s.energy),
                 self,
-                (pos_traj.squeeze(), vel_traj.squeeze(), acc_traj.squeeze(), E_traj, Eext_traj, moments_traj[:,:,0], moments_traj[:,:,1], moments_traj[:,:,2]),
+                (pos_traj, vel_traj, acc_traj, E_traj, Eext_traj, moments_traj[...,0], moments_traj[...,1:3], moments_traj[...,3:]),
                 is_leaf=lambda x: x is None,
             )
         else:
             new_obj = eqx.tree_at(
                 lambda s: (s.positions, s.velocities, s.accelerations, s.E_field, s.E_ext, s.rho),
                 self,
-                (pos_traj.squeeze(), vel_traj.squeeze(), acc_traj.squeeze(), E_traj, Eext_traj, moments_traj[:,:,0]),
+                (pos_traj, vel_traj, acc_traj, E_traj, Eext_traj, moments_traj[:,:,0]),
                 is_leaf=lambda x: x is None,
             )
         return new_obj
