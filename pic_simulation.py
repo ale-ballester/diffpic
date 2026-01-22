@@ -22,6 +22,7 @@ class PICSimulation(eqx.Module):
     m: float = eqx.field(static=True)
     q: float = eqx.field(static=True)
     eps0: float = eqx.field(static=True)
+    n_sort: int = eqx.field(static=True)
 
     # Frequency
     kvec: jax.Array
@@ -40,7 +41,7 @@ class PICSimulation(eqx.Module):
     momentum: jax.Array
     energy: jax.Array
 
-    def __init__(self, dim, boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, m=1, q=1, Z=1, eps0=1, t0=0, higher_moments=False):
+    def __init__(self, dim, boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, m=1, q=1, Z=1, eps0=1, t0=0, higher_moments=False, n_sort=None):
         self.dim = dim
         self.boxsize = boxsize
         self.N_particles = N_particles
@@ -57,6 +58,7 @@ class PICSimulation(eqx.Module):
         self.m = m
         self.q = q
         self.eps0 = eps0
+        self.n_sort = n_sort
 
         # Frequencies
         d = len(self.N_mesh)
@@ -88,6 +90,32 @@ class PICSimulation(eqx.Module):
         self.momentum = None
         self.energy = None
     
+    def sort_particles(self,pos,vel):
+        cell = jnp.floor(pos / self.dx).astype(jnp.int32)
+        cell = jnp.mod(cell, jnp.array(self.N_mesh))
+        cell_id = self._ravel_multi_index(cell, jnp.array(self.N_mesh))
+
+        perm = jnp.argsort(cell_id)
+        pos = pos[perm]
+        vel = vel[perm]
+
+        return pos, vel
+    
+    def maybe_sort(self,pos,vel,n):
+        def do_sort(state):
+            pos,vel = state
+            return self.sort_particles(pos,vel)
+
+        def no_sort(state):
+            return pos,vel
+
+        return jax.lax.cond(
+            (n % self.n_sort) == 0,
+            do_sort,
+            no_sort,
+            (pos,vel)
+        )
+    
     def create_y0(
         self,
         key,
@@ -110,6 +138,9 @@ class PICSimulation(eqx.Module):
         # enforce zero total momentum (helps remove finite-N bias)
         vel = vel - jnp.mean(vel, axis=0, keepdims=True)
 
+        if self.n_sort is not None:
+            pos, vel = self.sort_particles(pos,vel)
+
         return (pos, vel)
     
     def _ravel_multi_index(self, idxs, dims):
@@ -130,7 +161,7 @@ class PICSimulation(eqx.Module):
         d = frac.shape[-1]
 
         cell_vol = jnp.prod(self.dx)
-        w0 = (self.q * self.n0) * (jnp.prod(self.boxsize) / self.N_particles) / cell_vol
+        w0 = (self.n0) * (jnp.prod(self.boxsize) / self.N_particles) / cell_vol
 
         #grid_idx = [slice(0,1) for i in range(d)]
         #meshgrid = jnp.mgrid[grid_idx]
@@ -140,8 +171,8 @@ class PICSimulation(eqx.Module):
                 shape = (*self.N_mesh, 1)
                 moment_flat = jnp.zeros((self.Ng,1))
             else:
-                shape = (*self.N_mesh, self.dim)
-                moment_flat = jnp.zeros((self.Ng,self.dim))
+                shape = (*self.N_mesh, q.shape[-1])
+                moment_flat = jnp.zeros((self.Ng,q.shape[-1]))
             for bits in itertools.product([0, 1], repeat=int(d)):
                 b = jnp.array(bits, dtype=jnp.int32)                     # (d,)
                 # node indices for this corner
@@ -157,10 +188,10 @@ class PICSimulation(eqx.Module):
                 moment_flat = moment_flat.at[lin].add(contrib)
             return moment_flat.reshape(shape)
             
-        moments = deposit() # rho
+        moments = deposit(jnp.array(self.q)[None]) # rho (charge density)
         if self.higher_moments:
-            momentum = deposit(self.m * vel) # TODO: These are mass moments, but my w0 includes charge
-            energy = deposit(0.5 * self.m * vel**2) # TODO: These are mass moments, but my w0 includes charge
+            momentum = deposit(self.m * vel) # These are mass moments
+            energy = deposit(0.5 * self.m * jnp.sum(vel**2,axis=-1,keepdims=True)) # TODO: These are mass moments
             moments = jnp.concatenate((moments,momentum,energy),axis=-1)
         return moments
 
@@ -189,7 +220,7 @@ class PICSimulation(eqx.Module):
         E_k = [(-1j * kcomp * phi_k) for kcomp in self.kvec]
 
         E = jnp.stack([jnp.fft.ifftn(Ek).real for Ek in E_k], axis=-1)
-        return E, rho_k, phi_k
+        return E, rho_k
 
     def all_corner_bits(self, d: int, dtype=jnp.int32):
         C = 1 << d
@@ -269,8 +300,12 @@ class PICSimulation(eqx.Module):
         # (1/2) kick
         vel += acc * self.dt / 2.0
 
+        # Sort particles
+        if self.n_sort is not None: pos,vel = self.maybe_sort(pos,vel,n)
+
         return pos, vel, acc, E_grid, E_ext, moments
 
+    @jax.jit
     def run_simulation(self, y0, E_control=None):
         pos, vel = y0
 
@@ -307,7 +342,7 @@ class PICSimulation(eqx.Module):
             new_obj = eqx.tree_at(
                 lambda s: (s.positions, s.velocities, s.accelerations, s.E_field, s.E_ext, s.rho, s.momentum, s.energy),
                 self,
-                (pos_traj, vel_traj, acc_traj, E_traj, Eext_traj, moments_traj[...,0], moments_traj[...,1:3], moments_traj[...,3:]),
+                (pos_traj, vel_traj, acc_traj, E_traj, Eext_traj, moments_traj[...,0], moments_traj[...,1:3], moments_traj[...,3]),
                 is_leaf=lambda x: x is None,
             )
         else:

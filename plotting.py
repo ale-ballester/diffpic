@@ -48,13 +48,11 @@ def _field_energy(E_field, boxsize, N_mesh, eps0=1.0):
     return 0.5 * eps0 * jnp.sum(Emag2) * dA
 
 
-def _kinetic_energy(vel, m=1.0):
-    # vel: (Np,2)
-    return 0.5 * m * jnp.sum(jnp.sum(vel**2, axis=-1))
+def _kinetic_energy(energy):
+    return jnp.sum(energy,axis=(0,1))
 
-def _momentum(vel, m=1.0):
-    # vel: (Np,2)
-    return m * jnp.sum(vel, axis=0)  # (2,)
+def _momentum(momentum):
+    return jnp.sum(momentum,axis=(0,1))
 
 
 def _mass_from_rho(rho, boxsize, N_mesh):
@@ -217,9 +215,9 @@ def plot_time_series_diagnostics(
 
     for t in range(Nt):
         vel = sim.velocities[t]
-        K = K.at[t].set(_kinetic_energy(vel, m=float(sim.m)))
+        K = K.at[t].set(_kinetic_energy(sim.energy[t]))
         U = U.at[t].set(_field_energy(sim.E_field[t], sim.boxsize, sim.N_mesh, eps0=float(sim.eps0)))
-        P = _momentum(vel, m=float(sim.m))
+        P = _momentum(sim.momentum[t])
         Px = Px.at[t].set(P[0])
         Py = Py.at[t].set(P[1])
         M = M.at[t].set(_mass_from_rho(sim.rho[t], sim.boxsize, sim.N_mesh))
@@ -566,18 +564,6 @@ def _cell_area(boxsize, N_mesh):
     return dx * dy
 
 
-def _field_energy_from_E(E_xy, boxsize, N_mesh, eps0=1.0):
-    # E_xy: (Nx,Ny,2)
-    dA = _cell_area(boxsize, N_mesh)
-    Emag2 = np.sum(np.asarray(E_xy)**2, axis=-1)  # (Nx,Ny)
-    return 0.5 * float(eps0) * float(np.sum(Emag2)) * dA
-
-
-def _kinetic_energy_from_vel(v, m=1.0):
-    vv2 = np.sum(np.asarray(v)**2, axis=-1)  # (Np,)
-    return 0.5 * float(m) * float(np.sum(vv2))
-
-
 def _compute_k_axes(boxsize, N_mesh):
     # physical k axes (cycles per length * 2pi), consistent with fft2 indices
     Lx, Ly = float(boxsize[0]), float(boxsize[1])
@@ -891,7 +877,7 @@ def plot_field_energy_growth(
 
     for t in range(Nt):
         E = np.asarray(E_hist[t])
-        U[t] = _field_energy_from_E(E, sim.boxsize, sim.N_mesh, eps0=sim.eps0)
+        U[t] = _field_energy(E, sim.boxsize, sim.N_mesh, eps0=sim.eps0)
         Erms[t] = float(np.sqrt(np.mean(np.sum(E**2, axis=-1))))
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 3.8))
@@ -942,7 +928,7 @@ def plot_energies_separate(
 
     K = np.zeros((Nt,), dtype=np.float64)
     for t in range(Nt):
-        K[t] = _kinetic_energy_from_vel(vel_hist[t], m=sim.m)
+        K[t] = _kinetic_energy(sim.energy[t])
 
     U = None
     Erms = None
@@ -952,7 +938,7 @@ def plot_energies_separate(
         Erms = np.zeros((Nt,), dtype=np.float64)
         for t in range(Nt):
             E = np.asarray(E_hist[t])
-            U[t] = _field_energy_from_E(E, sim.boxsize, sim.N_mesh, eps0=sim.eps0)
+            U[t] = _field_energy(E, sim.boxsize, sim.N_mesh, eps0=sim.eps0)
             Erms[t] = float(np.sqrt(np.mean(np.sum(E**2, axis=-1))))
     else:
         # allow kinetic-only plotting
