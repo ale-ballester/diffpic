@@ -8,10 +8,10 @@ from plotting import scatter_animation, plot_pde_solution, plot_modes
 import matplotlib.pyplot as plt
 
 # Simulation parameters
-N_particles = 40000  # Number of particles
+N_particles = 100000  # Number of particles
 Nh = int(N_particles / 2)
-N_mesh = 256  # Number of mesh cells
-t1 = 20  # time at which simulation ends
+N_mesh = 400  # Number of mesh cells
+t1 = 30  # time at which simulation ends
 dt = 0.1  # timestep
 boxsize = 10*jnp.pi  # periodic domain [0,boxsize]
 n0 = 1  # electron number density

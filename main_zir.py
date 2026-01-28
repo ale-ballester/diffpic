@@ -4,10 +4,12 @@ from pic_simulation import PICSimulation
 from plotting import scatter_animation, plot_pde_solution, plot_modes
 import matplotlib.pyplot as plt
 
+jax.config.update('jax_enable_x64', True)
+
 # Simulation parameters
 N_particles = 100000  # Number of particles
 Nh = int(N_particles / 2)
-N_mesh = 4000  # Number of mesh cells
+N_mesh = 400  # Number of mesh cells
 t1 = 30  # time at which simulation ends
 dt = 0.1  # timestep
 boxsize = 10*jnp.pi  # periodic domain [0,boxsize]
@@ -16,11 +18,10 @@ vb = 2.4  # beam velocity
 vth = 0.5  # beam width
 pos_sample = False
 
-
 pic = PICSimulation(boxsize, N_particles, N_mesh, n0, vb, vth, dt, t1, t0=0, higher_moments=True)
 
 key = jax.random.key(42)
-y0 = pic.create_y0(key)
+y0 = pic.create_y0(key,eps=1e-2)
 
 pic = pic.run_simulation(y0)
 
