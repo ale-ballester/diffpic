@@ -12,7 +12,7 @@ print(jax.devices())
 # Simulation parameters
 N_particles = 51200  # Number of particles
 N_mesh = (32,32)  # Number of mesh cells
-t1 = 200  # time at which simulation ends
+t1 = 30  # time at which simulation ends
 dt = 0.1  # timestep
 boxsize = jnp.array([3*jnp.pi,3*jnp.pi])  # periodic domain [0,boxsize]
 n0 = 1  # electron number density

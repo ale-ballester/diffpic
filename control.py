@@ -241,8 +241,9 @@ class ModeFeedbackActuator(eqx.Module):
     # -------------------------
     # Static hyperparameters
     # -------------------------
-    N_mesh: int = eqx.field(static=True)
-    boxsize: float = eqx.field(static=True)
+    dim: int = eqx.field(static=True)
+    boxsize: jax.Array = eqx.field(static=True)
+    N_mesh: Tuple[int, ...] = eqx.field(static=True)
 
     n_modes_space_in: int = eqx.field(static=True)
     n_modes_space_out: int = eqx.field(static=True)
@@ -265,7 +266,8 @@ class ModeFeedbackActuator(eqx.Module):
     K0: jax.Array | None           # (n_out, n_in) complex64 if linear
     dc_value: jax.Array | None     # (1,) float if include_dc else None
 
-    def __init__(self,N_mesh,boxsize,use_linear=False,width=64,depth=2,include_dc=False,u_max=None,zero=False,closed_loop=True,n_modes_space_in=4,n_modes_space_out=4,init_scale=1.0,*,key):
+    def __init__(self,dim,N_mesh,boxsize,use_linear=False,width=64,depth=2,include_dc=False,u_max=None,zero=False,closed_loop=True,n_modes_space_in=4,n_modes_space_out=4,init_scale=1.0,*,key):
+        self.dim = dim
         self.N_mesh = N_mesh
         self.boxsize = boxsize
         self.include_dc = include_dc
@@ -281,7 +283,7 @@ class ModeFeedbackActuator(eqx.Module):
 
         if self.use_linear:
             k1, k2, k3 = jax.random.split(key, num=3)
-            shape = (self.n_modes_space_out,self.n_modes_space_in)
+            shape = (self.n_modes_space_out**self.dim,self.n_modes_space_in**self.dim)
             self.K0 = self.init_scale * (
                     jax.random.normal(k1, shape, dtype=jnp.float64)
                     + 1j * jax.random.normal(k2, shape, dtype=jnp.float64)
@@ -295,8 +297,8 @@ class ModeFeedbackActuator(eqx.Module):
         else:
             self.K0 = None
             self.dc_value = None
-            in_size = 2*self.n_modes_space_in
-            out_size = 2*self.n_modes_space_out
+            in_size = (2*self.n_modes_space_in)**self.dim
+            out_size = (2*self.n_modes_space_out)**self.dim
             if self.include_dc: 
                 in_size += 1
                 out_size += 1
@@ -325,7 +327,7 @@ class ModeFeedbackActuator(eqx.Module):
         """
         #jax.debug.print("Current gain: {gain}", gain=jnp.linalg.norm(self.K0))
         if self.zero:
-            return jnp.zeros((self.N_mesh,), dtype=jnp.float32)
+            return jnp.zeros(self.N_mesh, dtype=jnp.float32)
 
         if self.use_linear:
             meas = state[1:self.n_modes_space_in+1]
@@ -420,270 +422,3 @@ class ModeFeedbackActuator(eqx.Module):
             )
 
             return eqx.tree_deserialise_leaves(f, model)
-
-class DissipativeModeFeedbackActuator(eqx.Module):
-    # -------------------------
-    # Static hyperparameters
-    # -------------------------
-    N_mesh: int = eqx.field(static=True)
-    boxsize: float = eqx.field(static=True)
-
-    n_modes_space_in: int = eqx.field(static=True)
-    n_modes_space_out: int = eqx.field(static=True)
-
-    width: int = eqx.field(static=True)
-    depth: int = eqx.field(static=True)
-
-    include_dc: bool = eqx.field(static=True)
-    u_max: float | None = eqx.field(static=True)
-
-    zero: bool = eqx.field(static=True)
-    closed_loop: bool = eqx.field(static=True)
-
-    # -------------------------
-    # Learnable / leaf params
-    # -------------------------
-    mlp: eqx.Module | None
-
-    def __init__(
-        self,
-        N_mesh,
-        boxsize,
-        *,
-        width=64,
-        depth=2,
-        include_dc=False,
-        u_max=None,
-        zero=False,
-        closed_loop=True,
-        n_modes_space_in=4,
-        n_modes_space_out=4,
-        key,
-    ):
-        self.N_mesh = int(N_mesh)
-        self.boxsize = float(boxsize)
-        self.include_dc = bool(include_dc)
-        self.u_max = u_max
-        self.zero = bool(zero)
-        self.closed_loop = bool(closed_loop)
-        self.n_modes_space_in = int(n_modes_space_in)
-        self.n_modes_space_out = int(n_modes_space_out)
-        self.width = int(width)
-        self.depth = int(depth)
-
-        # INPUT: Re/Im of observed modes (plus optional DC real)
-        in_size = 2 * self.n_modes_space_in + (1 if self.include_dc else 0)
-
-        # OUTPUT: one REAL gain per complex output mode (plus optional DC gain)
-        out_size = self.n_modes_space_out + (1 if self.include_dc else 0)
-
-        self.mlp = eqx.nn.MLP(
-            in_size=in_size,
-            out_size=out_size,
-            width_size=self.width,
-            depth=self.depth,
-            activation=jnn.tanh,
-            key=key,
-        )
-
-    def __call__(self, n: int, *, state=None):
-        """Return E_ext(x) on the grid for step index n.
-
-        Parameters
-        ----------
-        n : int
-            timestep index (kept for interface compatibility)
-        state : complex array, shape (N_mesh//2+1,)
-            One-sided rFFT coefficients of momentum/current J(x) at current step.
-
-        Returns
-        -------
-        E_ext : float array, shape (N_mesh,)
-        """
-        if self.zero:
-            return jnp.zeros((self.N_mesh,), dtype=jnp.float64)
-        if self.mlp is None:
-            raise ValueError("MLP is required!")
-        if state is None:
-            raise ValueError("closed_loop actuator requires `state` (rFFT of momentum/current).")
-
-        # -------------------------
-        # Build REAL observation vector x_in from observed modes
-        # -------------------------
-        # Observe J modes: 1..n_in (and optional DC)
-        Jin = state[: self.n_modes_space_in + 1]  # includes DC at index 0
-
-        if self.include_dc:
-            # x_in = [J0_real, Re(J1..Jn), Im(J1..Jn)]
-            x_in = jnp.concatenate(
-                [
-                    jnp.array([jnp.real(Jin[0])], dtype=jnp.float64),
-                    jnp.real(Jin[1:]).astype(jnp.float64),
-                    jnp.imag(Jin[1:]).astype(jnp.float64),
-                ],
-                axis=0,
-            )  # shape: 1 + 2*n_in
-        else:
-            # x_in = [Re(J1..Jn), Im(J1..Jn)]
-            x_in = jnp.concatenate(
-                [
-                    jnp.real(Jin[1:]).astype(jnp.float64),
-                    jnp.imag(Jin[1:]).astype(jnp.float64),
-                ],
-                axis=0,
-            )  # shape: 2*n_in
-
-        # -------------------------
-        # Predict nonnegative gains (one per output mode [+ optional DC])
-        # -------------------------
-        gains = jnn.softplus(self.mlp(x_in)).astype(jnp.float64)  # (n_out [+1]), >= 0
-
-        # -------------------------
-        # Build dissipative control: E_m = -alpha_m * J_m  (controlled band)
-        # -------------------------
-        spec = jnp.zeros((self.N_mesh // 2 + 1,), dtype=jnp.complex64)
-
-        Jout = state[: self.n_modes_space_out + 1]  # includes DC at index 0
-
-        if self.include_dc:
-            alpha0 = gains[0]
-            J0 = jnp.real(Jout[0]).astype(jnp.float64)   # real
-            E0 = (-alpha0 * J0).astype(jnp.float64)      # real
-            spec = spec.at[0].set(E0.astype(jnp.complex64))
-
-            alpha = gains[1 : 1 + self.n_modes_space_out]  # (n_out,)
-            Jm = Jout[1 : 1 + self.n_modes_space_out]      # (n_out,) complex
-            # Because of the sign conventions in PICSimulator, dissipative means + sign here
-            Em = (alpha * Jm).astype(jnp.complex64)
-            spec = spec.at[1 : 1 + self.n_modes_space_out].set(Em)
-        else:
-            alpha = gains[: self.n_modes_space_out]        # (n_out,)
-            Jm = Jout[1 : 1 + self.n_modes_space_out]      # (n_out,) complex
-            # Because of the sign conventions in PICSimulator, dissipative means + sign here
-            Em = (alpha * Jm).astype(jnp.complex64)
-            spec = spec.at[1 : 1 + self.n_modes_space_out].set(Em)
-
-        # Optional magnitude clipping in Fourier domain
-        if self.u_max is not None:
-            mag = jnp.abs(spec)
-            spec = jnp.where(mag > self.u_max, spec * (self.u_max / (mag + 1e-12)), spec)
-
-        # Back to real space field
-        return jnp.fft.irfft(spec, n=self.N_mesh).real.astype(jnp.float64)
-
-    # -----------------------
-    # Save / Load
-    # -----------------------
-    def save_model(self, filename: str):
-        with open(filename, "wb") as f:
-            hyperparams = {
-                "zero": bool(self.zero),
-                "closed_loop": bool(self.closed_loop),
-                "N_mesh": int(self.N_mesh),
-                "boxsize": float(self.boxsize),
-                "width": int(self.width),
-                "depth": int(self.depth),
-                "n_modes_space_in": int(self.n_modes_space_in),
-                "n_modes_space_out": int(self.n_modes_space_out),
-                "include_dc": bool(self.include_dc),
-                "u_max": float(self.u_max) if self.u_max is not None else None,
-            }
-            f.write((json.dumps(hyperparams) + "\n").encode())
-            eqx.tree_serialise_leaves(f, self)
-
-    @classmethod
-    def load_model(cls, filename: str):
-        with open(filename, "rb") as f:
-            hyperparams = json.loads(f.readline().decode())
-
-            # IMPORTANT: build the same structure as saved:
-            # use_linear/include_dc decide which leaves exist (K0/dc_value vs mlp).
-            model = cls(
-                N_mesh=hyperparams["N_mesh"],
-                boxsize=hyperparams["boxsize"],
-                width=hyperparams.get("width", 64),
-                depth=hyperparams.get("depth", 2),
-                include_dc=hyperparams.get("include_dc", False),
-                u_max=hyperparams.get("u_max", None),
-                zero=hyperparams.get("zero", False),
-                closed_loop=hyperparams.get("closed_loop", True),
-                n_modes_space_in=hyperparams.get("n_modes_space_in", 4),
-                n_modes_space_out=hyperparams.get("n_modes_space_out", 4),
-                key=jax.random.PRNGKey(0),  # overwritten by deserialised leaves
-            )
-
-            return eqx.tree_deserialise_leaves(f, model)
-
-def ctrb(A, B):
-    n = A.shape[0]
-    blocks = []
-    AB = B
-    for _ in range(n):
-        blocks.append(AB)
-        AB = A @ AB
-    return jnp.concatenate(blocks, axis=1)
-
-def continuous_lqr(A, B, Q=None, R=None):
-    """
-    Continuous-time LQR for xdot = A x + B u.
-    Returns K, P, eigvals(A-BK)
-    """
-    A_np = jnp.asarray(A)
-    B_np = jnp.asarray(B)
-    n = A_np.shape[0]
-    m = B_np.shape[1]
-
-    if Q is None:
-        Q_np = jnp.eye(n)
-    else:
-        Q_np = jnp.asarray(Q)
-
-    if R is None:
-        R_np = jnp.eye(m)
-    else:
-        R_np = jnp.asarray(R)
-
-    # Solve CARE: A^T P + P A - P B R^{-1} B^T P + Q = 0
-    P = scipy.linalg.solve_continuous_are(A_np, B_np, Q_np, R_np)
-
-    # K = R^{-1} B^T P
-    K = jnp.linalg.solve(R_np, B_np.T @ P)
-
-    eig_cl = jnp.linalg.eigvals(A_np - B_np @ K)
-    return jnp.asarray(K), jnp.asarray(P), jnp.asarray(eig_cl)
-
-def discrete_lqr(A, B, Q=None, R=None):
-    """
-    Discrete-time LQR for x_{k+1} = A x_k + B u_k.
-    Minimizes sum_{k=0}^\infty (x_k^T Q x_k + u_k^T R u_k).
-    Returns K, P, eigvals(A - B K)
-    """
-    A_np = jnp.asarray(A)
-    B_np = jnp.asarray(B)
-    n = A_np.shape[0]
-    m = B_np.shape[1]
-
-    if Q is None:
-        Q_np = jnp.eye(n)
-    else:
-        Q_np = jnp.asarray(Q)
-
-    if R is None:
-        R_np = jnp.eye(m)
-    else:
-        R_np = jnp.asarray(R)
-
-    # Solve DARE: P = A^T P A - A^T P B (R + B^T P B)^{-1} B^T P A + Q
-    # scipy returns a NumPy array; we'll wrap back to jnp
-    P = scipy.linalg.solve_discrete_are(
-        jnp.asarray(A_np), jnp.asarray(B_np), jnp.asarray(Q_np), jnp.asarray(R_np)
-    )
-
-    P = jnp.asarray(P)
-
-    # K = (R + B^T P B)^{-1} (B^T P A)
-    S = R_np + B_np.T @ P @ B_np
-    K = jnp.linalg.solve(S, B_np.T @ P @ A_np)
-
-    eig_cl = jnp.linalg.eigvals(A_np - B_np @ K)
-    return jnp.asarray(K), jnp.asarray(P), jnp.asarray(eig_cl)
